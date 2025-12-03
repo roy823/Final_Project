@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+# 如果你的模型文件超过 100MB，必须忽略它，否则推送会失败
+checkpoints/

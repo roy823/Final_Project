@@ -1,0 +1,6 @@
+gymnasium
+stable-baselines3[extra]
+ase
+numpy
+rich
+
