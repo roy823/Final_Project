@@ -12,10 +12,16 @@ try:
     from ase.build import fcc111
     from ase.visualize.plot import plot_atoms
     from ase import Atoms
+    from ase.calculators.emt import EMT
+    from ase.optimize import BFGS
+    from ase.constraints import FixAtoms
 except ImportError:  # pragma: no cover
     fcc111 = None
     plot_atoms = None
     Atoms = None
+    EMT = None
+    BFGS = None
+    FixAtoms = None
 
 from chem_gym.config import EnvConfig
 
@@ -23,9 +29,19 @@ from chem_gym.config import EnvConfig
 class ChemGymEnv(gym.Env):
     """
     Gymnasium environment for swapping atoms on an HEA slab.
+    Integreated with ASE EMT calculator for physical realism.
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 4}
+    # 来源: Materials Project / Kittel / ICSD
+    LATTICE_CONSTANTS = {
+        "Pt": 3.92,
+        "Pd": 3.89,
+        "Cu": 3.61,
+        "Ni": 3.52,
+        "Au": 4.08, # 预留扩展
+        "Ag": 4.09  # 预留
+    }
 
     def __init__(self, config: EnvConfig, surrogate=None):
         super().__init__()
@@ -68,7 +84,7 @@ class ChemGymEnv(gym.Env):
         
         # 状态追踪变量
         self.initial_energy = 0.0
-        self.prev_energy = 0.0  # 新增：用于计算差分奖励
+        self.prev_energy = 0.0
         self.current_energy = 0.0
         self.current_uncertainty = 0.0
         self.steps = 0
@@ -78,8 +94,8 @@ class ChemGymEnv(gym.Env):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
 
-        # --- FIX: 固定成分，随机洗牌 (Stoichiometry Control) ---
-        # 确保每种元素的数量尽可能相等，而不是随机抽取
+        # --- Stoichiometry Control ---
+        # 确保每种元素的数量尽可能相等
         n_base = self.n_sites // self.n_elements
         remainder = self.n_sites % self.n_elements
         
@@ -90,14 +106,16 @@ class ChemGymEnv(gym.Env):
             
         self.state = np.array(base_state, dtype=np.int32)
         self.rng.shuffle(self.state) # 仅打乱位置
-        # ---------------------------------------------------
+        # -----------------------------
 
         self.steps = 0
+        # 重置 atoms 为 None，强制 _build_atoms_from_state 重新计算晶格常数并建模
+        self.atoms = None 
         self.atoms = self._build_atoms_from_state()
 
         self.initial_energy, self.current_uncertainty = self._evaluate_energy(self.atoms)
         self.current_energy = self.initial_energy
-        self.prev_energy = self.initial_energy # 初始化上一轮能量
+        self.prev_energy = self.initial_energy
 
         observation = self._state_to_observation()
         info = {
@@ -118,17 +136,24 @@ class ChemGymEnv(gym.Env):
         self.atoms = self._build_atoms_from_state()
         self.current_energy, self.current_uncertainty = self._evaluate_energy(self.atoms)
 
-        # --- FIX: 差分奖励 (Differential Reward) ---
-        # 奖励 = 能量降低量 = 上一步能量 - 当前能量
+        # --- 奖励函数优化 ---
+        # 1. 差分奖励: 能量降低量
         energy_diff = self.prev_energy - self.current_energy
-        reward = energy_diff - self.config.step_penalty
+        # 2. 缩放奖励: 放大 10 倍，使梯度更显著
+        # 3. 步数惩罚: 鼓励尽快找到最优解
+        reward = (energy_diff * 10.0) - self.config.step_penalty
         
         # 更新历史
         self.prev_energy = self.current_energy
-        # -------------------------------------------
+        # --------------------
 
         terminated = False
         truncated = self.steps >= self.config.max_steps
+        
+        # 可选：安全截断，如果能量异常爆炸（>5.0 eV/atom 是极其不正常的），提前结束
+        if self.current_energy > 5.0:
+            reward -= 10.0 # 给予重罚
+            terminated = True
 
         observation = self._state_to_observation()
         info = {
@@ -136,7 +161,7 @@ class ChemGymEnv(gym.Env):
             "uncertainty": self.current_uncertainty,
             "swapped_sites": (i, j),
             "energy_improvement": self.initial_energy - self.current_energy,
-            "atoms": self.atoms  # <--- [关键修复] 必须传递 atoms 给 OracleWrapper 使用
+            "atoms": self.atoms
         }
         return observation, reward, terminated, truncated, info
 
@@ -180,24 +205,92 @@ class ChemGymEnv(gym.Env):
         return {"node_features": node_features, "adjacency": adjacency}
 
     def _build_atoms_from_state(self):
+        """
+        根据当前状态构建 ASE Atoms 对象。
+        使用 Vegard 定律动态计算平均晶格常数，避免初始应力过大。
+        """
         if fcc111 is None:
             return None
         
+        # 1. 如果 atoms 尚未初始化，创建它
         if self.atoms is None:
-             self.atoms = fcc111("Cu", size=(self.config.slab_size[0], self.config.slab_size[1], 3), a=3.6, vacuum=7.0)
+            # [关键] Vegard's Law: 计算当前成分的加权平均晶格常数
+            current_elements = [self.element_types[i] for i in self.state]
+            
+            # 从 LATTICE_CONSTANTS 查表，默认 3.7
+            avg_lattice_constant = float(np.mean([
+                self.LATTICE_CONSTANTS.get(el, 3.7) for el in current_elements
+            ]))
+            
+            # 使用计算出的 a 构建底板
+            # size=(x, y, 4) 表示 4 层厚度，通常底部 2 层固定用于模拟体相
+            self.atoms = fcc111(
+                "Cu", # 这里的 'Cu' 只是占位符，后面会替换符号
+                size=(self.config.slab_size[0], self.config.slab_size[1], 4), 
+                a=avg_lattice_constant, 
+                vacuum=10.0
+            )
+
+            # [关键] 添加约束：固定底部 2 层原子，防止板子飘动
+            if FixAtoms is not None:
+                n_total = len(self.atoms)
+                n_surface = self.n_sites  # 最表面一层的原子数 (slab_size x * y)
+                
+                # 固定除了最上层以外的所有原子
+                n_fixed = n_total - n_surface
+                constraint = FixAtoms(indices=range(n_fixed))
+                self.atoms.set_constraint(constraint)
         
+        # 2. 更新表面原子的化学符号
         symbols = self.atoms.get_chemical_symbols()
-        # 仅更新最上层表面原子
+        # ASE 的 fcc111 构建中，表面原子通常在列表末尾
         start_idx = len(symbols) - self.n_sites
         new_surface_symbols = [self.element_types[idx] for idx in self.state]
         
+        # 批量更新符号
         for k, sym in enumerate(new_surface_symbols):
             self.atoms[start_idx + k].symbol = sym
+            
         return self.atoms
 
     def _evaluate_energy(self, atoms: Optional["Atoms"]):
-        if self.surrogate is None:
-            # 如果没有代理模型，返回一个伪能量（仅用于测试）
-            pseudo_energy = float(np.mean(self.state)) 
-            return pseudo_energy, 0.0
-        return self.surrogate.evaluate(atoms)
+        """
+        计算当前构型的能量。
+        策略：Surrogate (优先) -> EMT + Relaxation (物理基线)。
+        """
+        if atoms is None:
+            return 0.0, 0.0
+
+        # 1. 优先使用代理模型 (AI Surrogate)
+        if self.surrogate is not None:
+            # 注意：如果 surrogate 返回的是随机数，请确保在训练早期将其关闭
+            # 或者在 ensemble.py 中实现逻辑，当模型为空时调用 _evaluate_physics
+            return self.surrogate.evaluate(atoms)
+        
+        # 2. 如果没有代理，使用 ASE 内置 EMT 计算器 (Ground Truth Baseline)
+        if EMT is not None:
+            try:
+                # [关键] 在副本上进行计算和松弛，不破坏环境的主状态 (atoms)的位置
+                # 这样可以保持晶格的整齐，只获取能量值
+                calc_atoms = atoms.copy()
+                calc_atoms.calc = EMT()
+                
+                # [关键] 局部结构优化 (Pre-relaxation / Soft Minimization)
+                # 只跑 10 步，消除原子重叠造成的巨大虚假能量
+                if BFGS is not None:
+                    # logfile=None 静默模式，不输出冗长的优化日志
+                    dyn = BFGS(calc_atoms, logfile=None) 
+                    dyn.run(fmax=0.5, steps=10)
+                
+                potential_energy = calc_atoms.get_potential_energy()
+                
+                # 归一化能量 (eV/atom) 以利于 RL 训练收敛
+                energy_per_atom = potential_energy / len(calc_atoms)
+                
+                return energy_per_atom, 0.0  # EMT 不确定度为 0
+            except Exception as e:
+                # 容错处理，防止偶尔的物理计算崩溃中断训练
+                print(f"Warning: EMT calculation failed: {e}")
+                return 0.0, 0.0
+
+        return 0.0, 0.0
