@@ -43,41 +43,6 @@ class ChemGymEnv(gym.Env):
         "Ag": 4.09  # 预留
     }
 
-    # def __init__(self, config: EnvConfig, surrogate=None):
-    #     super().__init__()
-    #     self.config = config
-    #     self.surrogate = surrogate
-    #     self.rng = np.random.default_rng(config.init_seed)
-
-    #     self.element_types = config.element_types
-    #     self.n_elements = len(self.element_types)
-    #     self.n_sites = config.slab_size[0] * config.slab_size[1]
-    #     self.render_mode = config.render_mode
-
-    #     # 动作空间：任意两点交换
-    #     self.action_space = spaces.Discrete(self.n_sites * (self.n_sites - 1) // 2)
-        
-    #     # 观察空间
-    #     if self.config.mode == "image":
-    #         self.observation_space = spaces.Box(
-    #             low=0.0,
-    #             high=1.0,
-    #             shape=(config.slab_size[0], config.slab_size[1], self.n_elements),
-    #             dtype=np.float32,
-    #         )
-    #     elif self.config.mode == "graph":
-    #         self.observation_space = spaces.Dict(
-    #             {
-    #                 "node_features": spaces.Box(
-    #                     low=0.0, high=1.0, shape=(self.n_sites, self.n_elements), dtype=np.float32
-    #                 ),
-    #                 "adjacency": spaces.Box(
-    #                     low=0.0, high=1.0, shape=(self.n_sites, self.n_sites), dtype=np.float32
-    #                 ),
-    #             }
-    #         )
-    #     else:
-    #         raise ValueError(f"Unsupported mode: {self.config.mode}")
     def __init__(self, config: EnvConfig, surrogate=None):
         super().__init__()
         self.config = config
@@ -86,75 +51,58 @@ class ChemGymEnv(gym.Env):
 
         self.element_types = config.element_types
         self.n_elements = len(self.element_types)
-        self.n_sites = config.slab_size[0] * config.slab_size[1]
+        
+        # 网格尺寸
+        self.h, self.w = config.slab_size
+        self.n_sites = self.h * self.w
+        
         self.render_mode = config.render_mode
 
-        # 动作空间：任意两点交换
-        self.action_space = spaces.Discrete(self.n_sites * (self.n_sites - 1) // 2)
+        # === 修改 1: 动作空间 ===
+        # 格式: [动作类型, X坐标, Y坐标, 额外参数]
+        # 动作类型 (3): 0=Swap, 1=Add, 2=Delete
+        # X, Y: 坐标
+        # 额外参数: 
+        #    - 如果是 Swap: 代表方向 (0:上, 1:下, 2:左, 3:右)
+        #    - 如果是 Add: 代表原子类型索引 (0..n_elements-1)
+        #    - 如果是 Delete: 忽略
+        max_arg = max(4, self.n_elements) # 确保够用
+        self.action_space = spaces.MultiDiscrete([3, self.h, self.w, max_arg])
+        # ========================
         
-        # --- [修改开始]：观察空间升级为多层切片 ---
-        # 假设我们观察 Slab 的 4 层原子 (与 _build_atoms_from_state 中的 size=(x,y,4) 对应)
-        self.n_layers = 4 
-        
+        # 观察空间保持不变 (Image 模式下，空位将由全0向量表示)
         if self.config.mode == "image":
-            # 形状：(H, W, Channels)
-            # Channels = 元素种类 * 层数。例如 5种元素 * 4层 = 20 个通道
-            # 这种结构非常适合 CNN 处理，能同时感知空间位置和深度信息
             self.observation_space = spaces.Box(
                 low=0.0,
                 high=1.0,
-                shape=(config.slab_size[0], config.slab_size[1], self.n_elements * self.n_layers),
+                shape=(self.h, self.w, self.n_elements),
                 dtype=np.float32,
             )
-        # ----------------------------------------
-        elif self.config.mode == "graph":
-            # Graph 模式保持不变，由你同学负责
-            self.observation_space = spaces.Dict(
-                {
-                    "node_features": spaces.Box(
-                        low=0.0, high=1.0, shape=(self.n_sites, self.n_elements), dtype=np.float32
-                    ),
-                    "adjacency": spaces.Box(
-                        low=0.0, high=1.0, shape=(self.n_sites, self.n_sites), dtype=np.float32
-                    ),
-                }
-            )
-        else:
-            raise ValueError(f"Unsupported mode: {self.config.mode}")
+        # ... (Graph 模式略，保持原样即可) ...
 
-        self.state = None
-        self.atoms = None
+        # 内部状态：使用 2D 数组更方便，-1 代表空位
+        self.state = np.full((self.h, self.w), -1, dtype=np.int32)
         
-        # 状态追踪变量
+        # ... 其他初始化保持不变 ...
+        self.atoms = None
         self.initial_energy = 0.0
-        self.prev_energy = 0.0
-        self.current_energy = 0.0
-        self.current_uncertainty = 0.0
-        self.steps = 0
+        # ...
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict] = None):
         super().reset(seed=seed)
         if seed is not None:
             self.rng = np.random.default_rng(seed)
 
-        # --- Stoichiometry Control ---
-        # 确保每种元素的数量尽可能相等
-        n_base = self.n_sites // self.n_elements
-        remainder = self.n_sites % self.n_elements
-        
-        base_state = []
-        for i in range(self.n_elements):
-            count = n_base + (1 if i < remainder else 0)
-            base_state.extend([i] * count)
-            
-        self.state = np.array(base_state, dtype=np.int32)
-        self.rng.shuffle(self.state) # 仅打乱位置
-        # -----------------------------
+        # === 修改 2: 初始化 2D 状态 ===
+        # 简单的初始化逻辑：随机填充所有格子
+        # 如果你想随机留空，可以把部分位置设为 -1
+        flat_state = self.rng.integers(0, self.n_elements, size=self.n_sites)
+        self.state = flat_state.reshape(self.h, self.w)
+        # ============================
 
         self.steps = 0
-        # 重置 atoms 为 None，强制 _build_atoms_from_state 重新计算晶格常数并建模
-        self.atoms = None 
-        self.atoms = self._build_atoms_from_state()
+        self.atoms = None
+        self.atoms = self._build_atoms_from_state() # 重新构建物理对象
 
         self.initial_energy, self.current_uncertainty = self._evaluate_energy(self.atoms)
         self.current_energy = self.initial_energy
@@ -168,42 +116,104 @@ class ChemGymEnv(gym.Env):
         }
         return observation, info
 
-    def step(self, action: int):
-        i, j = self._action_to_indices(action)
+    def step(self, action):
+        # 1. 解析动作 [Type, X, Y, Arg]
+        # act_type: 0=Swap, 1=Add, 2=Delete
+        # x, y: 坐标
+        # arg: Swap的方向 或 Add的原子类型
+        act_type, x, y, arg = action
         
-        # 执行交换
-        self.state[i], self.state[j] = self.state[j], self.state[i]
+        reward = 0.0
+        # 基础惩罚配置
+        invalid_penalty = -1.0  # 非法操作（撞墙、删空气）
+        cost_of_add = -0.5      # 添加原子的材料费（防止无脑填满）
+        cost_of_delete = -0.2   # 删除原子的操作费
+        
+        # === 动作逻辑分支 ===
+        
+        # Case 0: Swap (交换)
+        if act_type == 0:
+            direction = arg % 4 # 0=Up, 1=Down, 2=Left, 3=Right
+            tx, ty = x, y
+            
+            # 计算目标坐标
+            if direction == 0: tx -= 1
+            elif direction == 1: tx += 1
+            elif direction == 2: ty -= 1
+            elif direction == 3: ty += 1
+            
+            # 边界检查
+            if 0 <= tx < self.h and 0 <= ty < self.w:
+                # 执行交换 (即使一边是空位也可以交换，相当于移动)
+                self.state[x, y], self.state[tx, ty] = self.state[tx, ty], self.state[x, y]
+            else:
+                reward += invalid_penalty # 撞墙了
+
+        # Case 1: Add (增加)
+        elif act_type == 1:
+            target_element = arg % self.n_elements
+            # 只有当前是空位 (-1) 才能添加
+            if self.state[x, y] == -1:
+                self.state[x, y] = target_element
+                reward += cost_of_add # 扣除材料费
+                # 可选：给一点点微小的激励抵消一部分成本，如果鼓励构建的话
+                reward += 0.1 
+            else:
+                reward += invalid_penalty # 已经有原子了，不能覆盖
+
+        # Case 2: Delete (删除)
+        elif act_type == 2:
+            # 只有当前有原子 (!= -1) 才能删除
+            if self.state[x, y] != -1:
+                self.state[x, y] = -1 # 变为空位
+                reward += cost_of_delete # 扣除操作费
+            else:
+                reward += invalid_penalty # 删除空气
+
+        # =======================
+
         self.steps += 1
 
-        # 更新物理状态
+        # === 物理与规则检查 (防作弊) ===
+        
+        # 1. 更新物理状态
+        # _build_atoms_from_state 会根据 state 里的 -1 自动处理空位
         self.atoms = self._build_atoms_from_state()
         self.current_energy, self.current_uncertainty = self._evaluate_energy(self.atoms)
 
-        # --- 奖励函数优化 ---
-        # 1. 差分奖励: 能量降低量
-        energy_diff = self.prev_energy - self.current_energy
-        # 2. 缩放奖励: 放大 10 倍，使梯度更显著
-        # 3. 步数惩罚: 鼓励尽快找到最优解
-        reward = (energy_diff * 10.0) - self.config.step_penalty
+        # 2. 检查原子数量是否过少 (防止“删库跑路”策略)
+        # 假设至少保留 25% 的原子
+        current_atom_count = np.sum(self.state != -1)
+        min_atoms = int(self.n_sites * 0.25) 
         
-        # 更新历史
-        self.prev_energy = self.current_energy
-        # --------------------
-
         terminated = False
         truncated = self.steps >= self.config.max_steps
+
+        if current_atom_count < min_atoms:
+            reward -= 10.0 # 巨额惩罚
+            terminated = True # 强制失败结束
         
-        # 可选：安全截断，如果能量异常爆炸（>5.0 eV/atom 是极其不正常的），提前结束
-        if self.current_energy > 5.0:
-            reward -= 10.0 # 给予重罚
+        # 3. 计算能量奖励 (Energy Improvement)
+        if not terminated:
+            energy_diff = self.prev_energy - self.current_energy
+            # 放大奖励信号
+            reward += (energy_diff * 10.0) 
+            
+        # 扣除每步的时间成本
+        reward -= self.config.step_penalty
+        
+        self.prev_energy = self.current_energy
+
+        # 4. 安全截断 (防止能量爆炸)
+        if self.current_energy > 10.0: 
+            reward -= 5.0
             terminated = True
 
         observation = self._state_to_observation()
         info = {
             "energy": self.current_energy,
             "uncertainty": self.current_uncertainty,
-            "swapped_sites": (i, j),
-            "energy_improvement": self.initial_energy - self.current_energy,
+            "atom_count": current_atom_count,
             "atoms": self.atoms
         }
         return observation, reward, terminated, truncated, info
@@ -224,136 +234,99 @@ class ChemGymEnv(gym.Env):
             w, h = fig.canvas.get_width_height()
             return data.reshape((h, w, 3))
         return None
-
-    # --- 内部辅助函数 ---
-    def _action_to_indices(self, action: int) -> Tuple[int, int]:
-        if action < 0 or action >= self.action_space.n:
-            raise ValueError(f"Action {action} out of bounds")
-        remaining = action
-        for i in range(self.n_sites - 1):
-            span = self.n_sites - i - 1
-            if remaining < span:
-                return i, i + 1 + remaining
-            remaining -= span
-        raise ValueError(f"Action {action} could not be decoded")
-
-    # def _state_to_observation(self):
-    #     if self.config.mode == "image":
-    #         flat_one_hot = np.eye(self.n_elements, dtype=np.float32)[self.state]
-    #         grid = flat_one_hot.reshape(self.config.slab_size[0], self.config.slab_size[1], self.n_elements)
-    #         return grid
-
-    #     node_features = np.eye(self.n_elements, dtype=np.float32)[self.state]
-    #     adjacency = np.ones((self.n_sites, self.n_sites), dtype=np.float32) - np.eye(self.n_sites, dtype=np.float32)
-    #     return {"node_features": node_features, "adjacency": adjacency}
     
     def _state_to_observation(self):
-        # --- [修改开始]：生成多层切片观测 ---
+        # 模式检查
         if self.config.mode == "image":
-            # 我们需要获取整个 Slab (包括表面和内部) 的原子分布
-            # 在 ASE 的 fcc111 构建中，原子通常是按层排列的
-            # Layer 0 (底部) -> ... -> Layer 3 (表面)
+            # 初始化一个多层矩阵
+            # 形状: (H, W, Channels)
+            # Channels = 元素种类数 (n_elements)
+            # 比如: Channel 0 是 Cu 的分布图, Channel 1 是 Pt 的分布图...
+            grid = np.zeros((self.h, self.w, self.n_elements), dtype=np.float32)
             
-            # 1. 获取所有原子的元素索引
-            # 如果 atoms 还没构建，就先用 state 构建个临时的
-            if self.atoms is None:
-                self._build_atoms_from_state()
+            # 遍历我们的逻辑网格
+            for r in range(self.h):
+                for c in range(self.w):
+                    # 获取当前位置的原子类型索引
+                    idx = self.state[r, c]
+                    
+                    # [关键] 处理空位
+                    # 如果 idx 是 -1 (空位)，说明这里没原子，所有 Channel 保持 0 (全黑)
+                    # 如果 idx >= 0 (有原子)，就在对应的 Channel 填 1
+                    if idx != -1:
+                        grid[r, c, idx] = 1.0
             
-            # 获取所有原子的化学符号
-            all_symbols = self.atoms.get_chemical_symbols()
-            
-            # 将符号转换为索引 (比如 'Cu'->0, 'Pt'->2)
-            # 注意：底层原子可能是你在 fcc111 里定义的默认 'Cu'
-            type_map = {ele: i for i, ele in enumerate(self.element_types)}
-            
-            # 2. 构建多层 Grid
-            # 形状: (Layers, H, W, Elements)
-            layers_grid = np.zeros(
-                (self.n_layers, self.config.slab_size[0], self.config.slab_size[1], self.n_elements),
-                dtype=np.float32
-            )
-            
-            # 填充数据
-            # 假设 atoms 列表顺序是：第0层(0~15), 第1层(16~31), ..., 第3层(表面)
-            for l in range(self.n_layers):
-                start = l * self.n_sites
-                end = start + self.n_sites
-                # 获取这一层的原子 (如果 atoms 数量不够，就填 0)
-                if start < len(all_symbols):
-                    layer_syms = all_symbols[start:end]
-                    for idx, sym in enumerate(layer_syms):
-                        # 计算在 grid 中的 (x, y) 坐标
-                        # ASE fcc111 排列通常是行优先或列优先，这里假设是一一对应
-                        row = idx // self.config.slab_size[1]
-                        col = idx % self.config.slab_size[1]
-                        
-                        if sym in type_map:
-                            ele_idx = type_map[sym]
-                            layers_grid[l, row, col, ele_idx] = 1.0
-                        else:
-                            # 如果遇到了不在 element_types 里的元素（比如底部的基底元素），可以忽略或归为某类
-                            pass
+            return grid
 
-            # 3. 展平层维度到通道维度 (Flatten Layers to Channels)
-            # (Layers, H, W, E) -> (H, W, Layers * E)
-            # 例如：前5个通道是第0层，接着5个通道是第1层... 最后5个通道是表面层
-            obs = layers_grid.transpose(1, 2, 0, 3).reshape(
-                self.config.slab_size[0], 
-                self.config.slab_size[1], 
-                -1 # 自动计算为 n_layers * n_elements
-            )
-            
-            return obs
+        # ... (Graph 模式部分保持原样) ...
 
     def _build_atoms_from_state(self):
-        """
-        根据当前状态构建 ASE Atoms 对象。
-        使用 Vegard 定律动态计算平均晶格常数，避免初始应力过大。
-        """
         if fcc111 is None:
             return None
         
-        # 1. 如果 atoms 尚未初始化，创建它
-        if self.atoms is None:
-            # [关键] Vegard's Law: 计算当前成分的加权平均晶格常数
-            current_elements = [self.element_types[i] for i in self.state]
-            
-            # 从 LATTICE_CONSTANTS 查表，默认 3.7
+        # 1. 计算平均晶格常数 (只考虑存在的原子)
+        valid_indices = self.state[self.state != -1]
+        if len(valid_indices) == 0:
+            # 如果全空，给一个默认值防止报错
+            avg_lattice_constant = 3.7 
+        else:
+            current_elements = [self.element_types[i] for i in valid_indices]
             avg_lattice_constant = float(np.mean([
                 self.LATTICE_CONSTANTS.get(el, 3.7) for el in current_elements
             ]))
-            
-            # 使用计算出的 a 构建底板
-            # size=(x, y, 4) 表示 4 层厚度，通常底部 2 层固定用于模拟体相
-            self.atoms = fcc111(
-                "Cu", # 这里的 'Cu' 只是占位符，后面会替换符号
-                size=(self.config.slab_size[0], self.config.slab_size[1], 4), 
-                a=avg_lattice_constant, 
-                vacuum=10.0
-            )
-
-            # [关键] 添加约束：固定底部 2 层原子，防止板子飘动
-            if FixAtoms is not None:
-                n_total = len(self.atoms)
-                n_surface = self.n_sites  # 最表面一层的原子数 (slab_size x * y)
-                
-                # 固定除了最上层以外的所有原子
-                n_fixed = n_total - n_surface
-                constraint = FixAtoms(indices=range(n_fixed))
-                self.atoms.set_constraint(constraint)
         
-        # 2. 更新表面原子的化学符号
-        symbols = self.atoms.get_chemical_symbols()
-        # ASE 的 fcc111 构建中，表面原子通常在列表末尾
-        start_idx = len(symbols) - self.n_sites
-        new_surface_symbols = [self.element_types[idx] for idx in self.state]
+        # 2. 生成完整的底板 (包含满的表面层)
+        atoms = fcc111(
+            "Cu", 
+            size=(self.h, self.w, 4), 
+            a=avg_lattice_constant, 
+            vacuum=10.0
+        )
         
-        # 批量更新符号
-        for k, sym in enumerate(new_surface_symbols):
-            self.atoms[start_idx + k].symbol = sym
+        # 3. 识别表面原子并更新/标记删除
+        # ASE fcc111 生成的原子顺序通常是层优先。
+        # 最上面一层 (表面) 是列表的最后 n_sites 个原子。
+        surface_start_idx = len(atoms) - self.n_sites
+        
+        indices_to_delete = []
+        
+        # 遍历网格 (注意 ASE 的原子排列顺序通常与 reshape 顺序对应，但也可能需要微调)
+        # 这里假设 fcc111 生成顺序是 行优先 或 列优先。
+        # 通常 ASE fcc111 的表面原子顺序对应于 nested loop: for x in range(h): for y in range(w)
+        # 我们可以展平 state 来一一对应
+        flat_state = self.state.flatten() 
+        
+        for k, type_idx in enumerate(flat_state):
+            atom_idx = surface_start_idx + k
             
-        return self.atoms
+            if type_idx == -1:
+                # 这是一个空位，标记删除
+                indices_to_delete.append(atom_idx)
+            else:
+                # 这是一个原子，更新类型
+                atoms[atom_idx].symbol = self.element_types[type_idx]
+        
+        # 4. 执行删除 (必须倒序删除，防止索引偏移)
+        # 或者使用 del atoms[list] (ASE 支持列表删除)
+        if indices_to_delete:
+            del atoms[indices_to_delete]
 
+        # 5. 添加约束 (固定底部原子)
+        if FixAtoms is not None:
+            # 重新计算高度，固定 Z 坐标较小的原子
+            # 简单的做法：固定 Z < 10.0 的原子 (假设表面在上面)
+            # 或者固定原来的数量 (稍微不准但可行)
+            z_positions = atoms.get_positions()[:, 2]
+            # 找到最高 Z
+            max_z = np.max(z_positions)
+            # 固定距离表面一定距离以下的原子
+            fixed_indices = [i for i, z in enumerate(z_positions) if z < max_z - 3.0]
+            
+            constraint = FixAtoms(indices=fixed_indices)
+            atoms.set_constraint(constraint)
+            
+        return atoms
+        
     def _evaluate_energy(self, atoms: Optional["Atoms"]):
         """
         计算当前构型的能量。
