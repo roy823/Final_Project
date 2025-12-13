@@ -75,31 +75,41 @@ def plot_structure_plotly(atoms, title, output_file, width=800, height=800):
 
     # 3. 绘制化学键 (Bonding) - 使用 CrystalNN
     try:
-        # 针对金属表面，CrystalNN 可能比较慢或连接过多，这里做一个简单的距离截断作为备选
-        # 或者直接用 CrystalNN
-        cnn = CrystalNN()
-        graph = StructureGraph.with_local_env_strategy(structure, cnn)
+        # [新增] 预检查：如果原子间距太小，CrystalNN 会崩溃
+        # 使用 pymatgen 的 distance matrix 快速检查
+        dist_matrix = structure.distance_matrix
+        np.fill_diagonal(dist_matrix, np.inf)
+        min_dist = np.min(dist_matrix)
         
-        bond_x, bond_y, bond_z = [], [], []
-        for i, j, d in graph.graph.edges(data=True):
-            start = coords[i]
-            end = coords[j]
-            # 过滤掉跨越边界太长的键 (PBC artifacts visualization issue)
-            if np.linalg.norm(start - end) < 5.0: 
-                bond_x.extend([start[0], end[0], None])
-                bond_y.extend([start[1], end[1], None])
-                bond_z.extend([start[2], end[2], None])
-        
-        fig.add_trace(go.Scatter3d(
-            x=bond_x, y=bond_y, z=bond_z,
-            mode='lines',
-            line=dict(color='grey', width=3),
-            opacity=0.5,
-            showlegend=False,
-            hoverinfo='none'
-        ))
+        if min_dist < 1.5: # 阈值可调，小于 1.5A 肯定有问题
+            logger.warning(f"Skipping bonding analysis: Atoms too close ({min_dist:.2f} A)")
+        else:
+            # 针对金属表面，CrystalNN 可能比较慢或连接过多，这里做一个简单的距离截断作为备选
+            # 或者直接用 CrystalNN
+            cnn = CrystalNN()
+            graph = StructureGraph.with_local_env_strategy(structure, cnn)
+            
+            bond_x, bond_y, bond_z = [], [], []
+            for i, j, d in graph.graph.edges(data=True):
+                start = coords[i]
+                end = coords[j]
+                # 过滤掉跨越边界太长的键 (PBC artifacts visualization issue)
+                if np.linalg.norm(start - end) < 5.0: 
+                    bond_x.extend([start[0], end[0], None])
+                    bond_y.extend([start[1], end[1], None])
+                    bond_z.extend([start[2], end[2], None])
+            
+            fig.add_trace(go.Scatter3d(
+                x=bond_x, y=bond_y, z=bond_z,
+                mode='lines',
+                line=dict(color='grey', width=3),
+                opacity=0.5,
+                showlegend=False,
+                hoverinfo='none'
+            ))
     except Exception as e:
-        logger.warning(f"Bonding analysis failed: {e}")
+        # [修改] 降级日志级别，避免刷屏
+        logger.debug(f"Bonding analysis failed: {e}")
 
     # 4. 绘制原子 (Atoms)
     atom_types = [site.specie.symbol for site in sites]

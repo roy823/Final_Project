@@ -17,6 +17,7 @@ def parse_args():
     parser.add_argument("--uncertainty-penalty", type=float, default=0.0)
     parser.add_argument("--oracle-threshold", type=float, default=None)
     parser.add_argument("--n-envs", type=int, default=1)
+    parser.add_argument("--learning-rate", type=float, default=3e-4, help="Learning rate for PPO")
     
     # Device defaults to auto
     parser.add_argument("--n-active-layers", type=int, default=2, help="Number of top layers to optimize")
@@ -73,10 +74,11 @@ def launch_train(args):
     # 3. 训练配置
     train_config = TrainConfig(
         total_timesteps=args.total_steps,
-        uncertainty_penalty=args.uncertainty_penalty,
-        oracle_threshold=args.oracle_threshold,
         n_envs=args.n_envs,
         device=args.device,
+        uncertainty_penalty=args.uncertainty_penalty,
+        oracle_threshold=args.oracle_threshold,
+        learning_rate=args.learning_rate,
     )
     
     # 4. 开始训练

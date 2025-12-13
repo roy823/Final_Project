@@ -2,7 +2,7 @@ from typing import Callable, Optional
 
 import gymnasium as gym
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize # [新增] 引入 VecNormalize
 
 from chem_gym.config import EnvConfig, TrainConfig
 from chem_gym.envs.chem_env import ChemGymEnv
@@ -68,7 +68,16 @@ def make_vec_env(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], 
                 
         return env
 
-    return DummyVecEnv([_make_single for _ in range(train_config.n_envs)])
+    # 1. 创建基础向量化环境
+    env = DummyVecEnv([_make_single for _ in range(train_config.n_envs)])
+    
+    # 2. [关键修改] 使用 VecNormalize 归一化观测值和奖励
+    # norm_obs=True: 归一化观测值 (对 GNN 输入特征很有帮助)
+    # norm_reward=True: 归一化奖励 (解决 explained_variance 低的核心)
+    # clip_obs=10.0, clip_reward=10.0: 防止极端值破坏训练
+    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10., clip_reward=10.)
+    
+    return env
 
 
 def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], train_config: TrainConfig,
@@ -101,10 +110,18 @@ def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], t
         gae_lambda=train_config.lam,
         device=train_config.device,
         # 开启 Tensorboard 日志，用于观察物理能量曲线
-        n_steps=128,
+        n_steps=2048, # [建议] 增加采样步数，让梯度更稳
         batch_size=64,
+        clip_range=0.1, # [建议] 限制更新幅度
+        ent_coef=0.01, # [建议] 增加探索
         tensorboard_log="./chem_gym_tensorboard/"
     )
     vis_callback = VisualizationCallback(save_freq=50, save_dir="./vis_results")
     model.learn(total_timesteps=train_config.total_timesteps, progress_bar=True, callback=vis_callback)
+    
+    # [新增] 保存 VecNormalize 的统计数据 (均值和方差)
+    # 否则加载模型时无法还原真实的奖励尺度
+    model.save("ppo_chem_gym")
+    vec_env.save("vec_normalize.pkl")
+    
     return model
