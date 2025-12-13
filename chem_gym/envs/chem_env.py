@@ -43,6 +43,41 @@ class ChemGymEnv(gym.Env):
         "Ag": 4.09  # 预留
     }
 
+    # def __init__(self, config: EnvConfig, surrogate=None):
+    #     super().__init__()
+    #     self.config = config
+    #     self.surrogate = surrogate
+    #     self.rng = np.random.default_rng(config.init_seed)
+
+    #     self.element_types = config.element_types
+    #     self.n_elements = len(self.element_types)
+    #     self.n_sites = config.slab_size[0] * config.slab_size[1]
+    #     self.render_mode = config.render_mode
+
+    #     # 动作空间：任意两点交换
+    #     self.action_space = spaces.Discrete(self.n_sites * (self.n_sites - 1) // 2)
+        
+    #     # 观察空间
+    #     if self.config.mode == "image":
+    #         self.observation_space = spaces.Box(
+    #             low=0.0,
+    #             high=1.0,
+    #             shape=(config.slab_size[0], config.slab_size[1], self.n_elements),
+    #             dtype=np.float32,
+    #         )
+    #     elif self.config.mode == "graph":
+    #         self.observation_space = spaces.Dict(
+    #             {
+    #                 "node_features": spaces.Box(
+    #                     low=0.0, high=1.0, shape=(self.n_sites, self.n_elements), dtype=np.float32
+    #                 ),
+    #                 "adjacency": spaces.Box(
+    #                     low=0.0, high=1.0, shape=(self.n_sites, self.n_sites), dtype=np.float32
+    #                 ),
+    #             }
+    #         )
+    #     else:
+    #         raise ValueError(f"Unsupported mode: {self.config.mode}")
     def __init__(self, config: EnvConfig, surrogate=None):
         super().__init__()
         self.config = config
@@ -57,15 +92,23 @@ class ChemGymEnv(gym.Env):
         # 动作空间：任意两点交换
         self.action_space = spaces.Discrete(self.n_sites * (self.n_sites - 1) // 2)
         
-        # 观察空间
+        # --- [修改开始]：观察空间升级为多层切片 ---
+        # 假设我们观察 Slab 的 4 层原子 (与 _build_atoms_from_state 中的 size=(x,y,4) 对应)
+        self.n_layers = 4 
+        
         if self.config.mode == "image":
+            # 形状：(H, W, Channels)
+            # Channels = 元素种类 * 层数。例如 5种元素 * 4层 = 20 个通道
+            # 这种结构非常适合 CNN 处理，能同时感知空间位置和深度信息
             self.observation_space = spaces.Box(
                 low=0.0,
                 high=1.0,
-                shape=(config.slab_size[0], config.slab_size[1], self.n_elements),
+                shape=(config.slab_size[0], config.slab_size[1], self.n_elements * self.n_layers),
                 dtype=np.float32,
             )
+        # ----------------------------------------
         elif self.config.mode == "graph":
+            # Graph 模式保持不变，由你同学负责
             self.observation_space = spaces.Dict(
                 {
                     "node_features": spaces.Box(
@@ -194,15 +237,73 @@ class ChemGymEnv(gym.Env):
             remaining -= span
         raise ValueError(f"Action {action} could not be decoded")
 
-    def _state_to_observation(self):
-        if self.config.mode == "image":
-            flat_one_hot = np.eye(self.n_elements, dtype=np.float32)[self.state]
-            grid = flat_one_hot.reshape(self.config.slab_size[0], self.config.slab_size[1], self.n_elements)
-            return grid
+    # def _state_to_observation(self):
+    #     if self.config.mode == "image":
+    #         flat_one_hot = np.eye(self.n_elements, dtype=np.float32)[self.state]
+    #         grid = flat_one_hot.reshape(self.config.slab_size[0], self.config.slab_size[1], self.n_elements)
+    #         return grid
 
-        node_features = np.eye(self.n_elements, dtype=np.float32)[self.state]
-        adjacency = np.ones((self.n_sites, self.n_sites), dtype=np.float32) - np.eye(self.n_sites, dtype=np.float32)
-        return {"node_features": node_features, "adjacency": adjacency}
+    #     node_features = np.eye(self.n_elements, dtype=np.float32)[self.state]
+    #     adjacency = np.ones((self.n_sites, self.n_sites), dtype=np.float32) - np.eye(self.n_sites, dtype=np.float32)
+    #     return {"node_features": node_features, "adjacency": adjacency}
+    
+    def _state_to_observation(self):
+        # --- [修改开始]：生成多层切片观测 ---
+        if self.config.mode == "image":
+            # 我们需要获取整个 Slab (包括表面和内部) 的原子分布
+            # 在 ASE 的 fcc111 构建中，原子通常是按层排列的
+            # Layer 0 (底部) -> ... -> Layer 3 (表面)
+            
+            # 1. 获取所有原子的元素索引
+            # 如果 atoms 还没构建，就先用 state 构建个临时的
+            if self.atoms is None:
+                self._build_atoms_from_state()
+            
+            # 获取所有原子的化学符号
+            all_symbols = self.atoms.get_chemical_symbols()
+            
+            # 将符号转换为索引 (比如 'Cu'->0, 'Pt'->2)
+            # 注意：底层原子可能是你在 fcc111 里定义的默认 'Cu'
+            type_map = {ele: i for i, ele in enumerate(self.element_types)}
+            
+            # 2. 构建多层 Grid
+            # 形状: (Layers, H, W, Elements)
+            layers_grid = np.zeros(
+                (self.n_layers, self.config.slab_size[0], self.config.slab_size[1], self.n_elements),
+                dtype=np.float32
+            )
+            
+            # 填充数据
+            # 假设 atoms 列表顺序是：第0层(0~15), 第1层(16~31), ..., 第3层(表面)
+            for l in range(self.n_layers):
+                start = l * self.n_sites
+                end = start + self.n_sites
+                # 获取这一层的原子 (如果 atoms 数量不够，就填 0)
+                if start < len(all_symbols):
+                    layer_syms = all_symbols[start:end]
+                    for idx, sym in enumerate(layer_syms):
+                        # 计算在 grid 中的 (x, y) 坐标
+                        # ASE fcc111 排列通常是行优先或列优先，这里假设是一一对应
+                        row = idx // self.config.slab_size[1]
+                        col = idx % self.config.slab_size[1]
+                        
+                        if sym in type_map:
+                            ele_idx = type_map[sym]
+                            layers_grid[l, row, col, ele_idx] = 1.0
+                        else:
+                            # 如果遇到了不在 element_types 里的元素（比如底部的基底元素），可以忽略或归为某类
+                            pass
+
+            # 3. 展平层维度到通道维度 (Flatten Layers to Channels)
+            # (Layers, H, W, E) -> (H, W, Layers * E)
+            # 例如：前5个通道是第0层，接着5个通道是第1层... 最后5个通道是表面层
+            obs = layers_grid.transpose(1, 2, 0, 3).reshape(
+                self.config.slab_size[0], 
+                self.config.slab_size[1], 
+                -1 # 自动计算为 n_layers * n_elements
+            )
+            
+            return obs
 
     def _build_atoms_from_state(self):
         """
