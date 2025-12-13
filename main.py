@@ -19,6 +19,7 @@ def parse_args():
     parser.add_argument("--n-envs", type=int, default=1)
     
     # Device defaults to auto
+    parser.add_argument("--n-active-layers", type=int, default=2, help="Number of top layers to optimize")
     parser.add_argument("--device", type=str, default="auto") 
     parser.add_argument("--seed", type=int, default=None)
     
@@ -51,8 +52,11 @@ def launch_train(args):
         print(f"[Main] Oracle checkpoint not found at {args.oracle_ckpt}. Running without Oracle.")
         real_oracle = None
 
-    env_config = EnvConfig(mode=args.obs_mode, init_seed=args.seed)
-    
+    env_config = EnvConfig(
+        mode=args.obs_mode, 
+        init_seed=args.seed,
+        n_active_layers=args.n_active_layers
+    )
     # 2. 初始化 Surrogate
     surrogate = None
     if args.surrogate_models > 0:
@@ -85,7 +89,6 @@ def launch_train(args):
 
 
 def launch_baselines(args):
-    env_config = EnvConfig(mode=args.obs_mode, init_seed=args.seed)
     # 对于 Baseline，如果不指定 surrogate-models > 0，也应使用 EMT
     if args.surrogate_models > 0:
         surrogate_cfg = SurrogateConfig(n_models=args.surrogate_models)
@@ -93,7 +96,11 @@ def launch_baselines(args):
     else:
         surrogate = None
         
-    env = ChemGymEnv(env_config, surrogate=surrogate)
+    env_config = EnvConfig(
+        mode=args.obs_mode, 
+        init_seed=args.seed,
+        n_active_layers=args.n_active_layers
+    )
     
     print("Running random search...")
     rand_result = random_search(env, episodes=10, horizon=50)

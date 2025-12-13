@@ -8,6 +8,7 @@ from chem_gym.config import EnvConfig, TrainConfig
 from chem_gym.envs.chem_env import ChemGymEnv
 from chem_gym.surrogate.ensemble import SurrogateEnsemble
 from chem_gym.analysis.vis_callback import VisualizationCallback
+from chem_gym.agent.graph_feature_extractor import CrystalGraphFeatureExtractor
 
 
 class UncertaintyPenaltyWrapper(gym.Wrapper):
@@ -75,16 +76,25 @@ def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], t
     vec_env = make_vec_env(env_config, surrogate, train_config, oracle_energy_fn)
     
     # 策略网络选择
+    policy_kwargs = {}
+
     if env_config.mode == "image":
         policy = "MlpPolicy" # 对于 4x4 网格，MLP 足以处理且比 CNN 更快
-    else:
+    elif env_config.mode == "graph":
         policy = "MultiInputPolicy" # 用于 graph 模式
+        policy_kwargs = dict(
+            features_extractor_class=CrystalGraphFeatureExtractor,
+            features_extractor_kwargs=dict(features_dim=256, hidden_dim=128, n_layers=3),
+        )
+    else:
+        raise ValueError(f"Unsupported mode: {env_config.mode}")
     
     print(f"[Trainer] Initializing PPO with policy: {policy}")
     
     model = PPO(
         policy,
         vec_env,
+        policy_kwargs=policy_kwargs,
         verbose=1,
         learning_rate=train_config.learning_rate,
         gamma=train_config.gamma,
