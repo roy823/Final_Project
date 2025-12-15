@@ -1,6 +1,34 @@
-gymnasium
-stable-baselines3[extra]
-ase
-numpy
-rich
+# 基础依赖
+gymnasium>=0.28.1
+stable-baselines3[extra]>=2.0.0
+ase>=3.22.0
+numpy>=1.25.0
+rich>=13.0.0
+
+# 用于配置管理
+dataclasses>=0.8; python_version < "3.7"
+
+# Materials Project 支持（可选）
+pymatgen>=2023.0.0
+
+# OCP/EquiformerV2 支持（需要 GPU）
+# 注意：fairchem 和 torch-geometric 需要与 CUDA 版本匹配的 PyTorch
+# torch>=2.0.0
+torch-geometric>=2.3.0
+# 安装命令：pip install fairchem-core
+
+# 科学计算
+scipy>=1.10.0
+pandas>=2.0.0
+
+# 进度条和可视化
+tqdm>=4.60.0
+matplotlib>=3.6.0
+
+# 类型注解
+typing-extensions>=4.5.0
+
+# 可选：用于生成报告
+# jupyter>=1.0.0
+# ipywidgets>=8.0.0
 

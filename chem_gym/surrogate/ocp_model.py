@@ -85,7 +85,41 @@ class EquiformerV2Oracle:
         try:
             # 加载 Checkpoint
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            
+
+            # --- [FIX] 加载 Normalizers (均值和标准差) ---
+            self.energy_mean = 0.0
+            self.energy_std = 1.0
+
+            if "normalizers" in checkpoint:
+                # 新的OCP格式使用 'target' 作为键名
+                if "target" in checkpoint["normalizers"]:
+                    normalizers = checkpoint["normalizers"]["target"]
+                    self.energy_mean = normalizers.get("mean", 0.0)
+                    self.energy_std = normalizers.get("std", 1.0)
+                # 旧的格式可能使用 'energy'
+                elif "energy" in checkpoint["normalizers"]:
+                    normalizers = checkpoint["normalizers"]["energy"]
+                    self.energy_mean = normalizers.get("mean", 0.0)
+                    self.energy_std = normalizers.get("std", 1.0)
+
+                # 确保转为 Tensor 并移到 GPU
+                if torch.is_tensor(self.energy_mean):
+                    self.energy_mean = self.energy_mean.to(self.device, dtype=torch.float32)
+                else:
+                    self.energy_mean = torch.tensor(self.energy_mean, dtype=torch.float32, device=self.device)
+
+                if torch.is_tensor(self.energy_std):
+                    self.energy_std = self.energy_std.to(self.device, dtype=torch.float32)
+                else:
+                    self.energy_std = torch.tensor(self.energy_std, dtype=torch.float32, device=self.device)
+
+                print(f"✓ Loaded normalizers: mean={self.energy_mean.item():.4f}, std={self.energy_std.item():.4f}")
+            else:
+                print("⚠ WARNING: No normalizers found in checkpoint! Predictions will be unscaled (wrong).")
+                print("  This usually happens if the checkpoint doesn't contain 'normalizers'.")
+                print("  You may need to find mean/std from model documentation.")
+            # --- [FIX END] ---
+
             # 处理 Config
             if "config" in checkpoint:
                 config = checkpoint["config"]
@@ -131,8 +165,8 @@ class EquiformerV2Oracle:
             self.a2g = AtomsToGraphs(
                 max_neigh=50,
                 radius=6.0,
-                r_energy=True,
-                r_forces=True,
+                r_energy=False,  # Don't read energy from atoms (we're predicting it)
+                r_forces=False,  # Don't read forces from atoms
                 r_distances=False,
                 r_fixed=True,
             )
@@ -144,34 +178,68 @@ class EquiformerV2Oracle:
             traceback.print_exc()
             raise e
 
-    def predict_energy(self, atoms: Atoms) -> float:
-        tags = np.ones(len(atoms), dtype=np.int64)
-        for constraint in atoms.constraints:
-            if hasattr(constraint, 'index'):
-                tags[constraint.index] = 0
-        atoms.set_tags(tags)
+    def predict_energy(self, atoms) -> float:
+        """
+        计算给定原子结构的总能量
 
-        data_list = self.a2g.convert_all([atoms], disable_tqdm=True)
+        支持 ASE Atoms 和 pymatgen Structure 两种对象
+        """
+        # 如果是 pymatgen Structure，转换为 ASE Atoms
+        ase_atoms = atoms
+
+        if hasattr(atoms, 'to_ase_atoms'):
+            ase_atoms = atoms.to_ase_atoms()
+        elif hasattr(atoms, 'get_positions'):
+            # 检查是否是 ASE Atoms
+            pass
+        else:
+            raise TypeError(f"Unsupported atom structure type: {type(atoms)}")
+
+        # 处理原子标签（tags）：约束设置为0，表面设置为1
+        tags = np.ones(len(ase_atoms), dtype=np.int64)
+
+        # 检查是否有约束属性
+        if hasattr(ase_atoms, 'constraints') and ase_atoms.constraints:
+            for constraint in ase_atoms.constraints:
+                if hasattr(constraint, 'index'):
+                    tags[constraint.index] = 0
+
+        ase_atoms.set_tags(tags)
+
+        data_list = self.a2g.convert_all([ase_atoms], disable_tqdm=True)
         batch = Batch.from_data_list(data_list).to(self.device)
 
         with torch.no_grad():
             output = self.model(batch)
-        
-        return output["energy"].item()
+
+        # --- [FIX] 应用反归一化 ---
+        # 公式: E_real = E_raw * std + mean
+        raw_energy = output["energy"]
+        energy = raw_energy * self.energy_std + self.energy_mean
+        # --- [FIX END] ---
+
+        return energy.item()
 
 if __name__ == "__main__":
     from ase.build import fcc111
     try:
         atoms = fcc111('Cu', size=(4,4,3), vacuum=10.0)
+
+        # Set periodic boundary conditions
+        atoms.set_pbc([True, True, True])
+
         ckpt = "checkpoints/eq2_83M_2M.pt"
         if not Path(ckpt).exists():
              ckpt = "../../checkpoints/eq2_83M_2M.pt"
-             
+
         if Path(ckpt).exists():
             oracle = EquiformerV2Oracle(ckpt, device="cuda")
             e = oracle.predict_energy(atoms)
-            print(f"Test Prediction: {e:.4f} eV")
+            print(f"✓ Test Prediction: {e:.4f} eV")
+            print("✓ EquiformerV2 Oracle is working correctly!")
         else:
             print(f"Checkpoint not found at {ckpt}")
     except Exception as e:
-        print(f"Test failed: {e}")
+        import traceback
+        print(f"✗ Test failed: {e}")
+        traceback.print_exc()

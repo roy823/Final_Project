@@ -53,23 +53,84 @@
 4) 主动学习：sigma 超阈值触发 EquiformerV2/查表，缓存更新，sigma 下降。
 
 ## 快速开始
-1) 安装基础依赖（CPU 可用，推荐 GPU）：
+
+### 1. 安装依赖
+
+#### 基础依赖（CPU 可用，推荐 GPU）：
+```bash
+pip install -r requirements.txt
 ```
-pip install -U gymnasium stable-baselines3[extra] ase torch numpy tensorboard rich
+
+#### OCP/EquiformerV2 支持（需要 GPU）：
+```bash
+# 安装 fairchem 包（EquiformerV2）
+pip install fairchem-core torch-geometric
+
+# 下载 EquiformerV2 检查点
+mkdir -p checkpoints
+wget https://dl.fbaipublicfiles.com/opencatalystproject/models/2023_06/oc20/s2ef/eq2_83M_2M.pt -O checkpoints/eq2_83M_2M.pt
 ```
-2) 安装 OCP 堆栈（EquiformerV2 & GemNet/PaiNN，需要匹配 CUDA 的 PyTorch）：
+
+#### Materials Project 支持（可选）：
+```bash
+# 用于下载真实晶体结构
+pip install pymatgen
+
+# 设置你的 Materials Project API 密钥
+export MP_API_KEY="your_api_key_here"
+# 你可以在 https://materialsproject.org/api 获取免费 API 密钥
 ```
-pip install ocp-torch           # EquiformerV2
-pip install ocp-models          # GemNet-OC / PaiNN
-# 下载对应 checkpoint，参见 OCP 官方说明
+
+### 2. 运行训练
+
+#### PPO 训练（使用图像观测）：
+```bash
+python main.py --mode train --obs-mode image --total-steps 5000
 ```
-3) 运行 PPO（占位代理）：
+
+#### PPO 训练（带不确定度惩罚和 Oracle）：
+```bash
+python main.py --mode train --obs-mode image \
+  --uncertainty-penalty 0.05 \
+  --oracle-threshold 0.3 \
+  --oracle-ckpt checkpoints/eq2_83M_2M.pt
 ```
-python main.py --mode train --obs-mode image --total-steps 5000 --uncertainty-penalty 0.05
+
+#### 多环境并行训练：
+```bash
+python main.py --mode train --obs-mode image --n-envs 4 --device cuda
 ```
-4) 运行基线：
-```
+
+### 3. 运行基线
+```bash
 python main.py --mode baseline --obs-mode image
+```
+
+### 4. 测试 Materials Project 结构
+
+我们提供了测试脚本，用于验证 EquiformerV2 在真实材料结构上的预测能力：
+
+```bash
+# 测试 EquiformerV2 Oracle（需要 API 密钥）
+MP_API_KEY="your_api_key" python test/test_mp_structures.py y
+
+# 测试 SurrogateEnsemble（快速测试，随机预测）
+python test/test_mp_structures.py
+```
+
+测试脚本会自动：
+1. 检查本地是否已有结构文件（`mp_structures/`）
+2. 如果没有，自动从 Materials Project 下载
+3. 使用指定的模型预测能量
+4. 输出每原子能量和总结
+
+### 5. 验证环境安装
+
+运行以下脚本检查环境配置：
+```bash
+python check_envs.py                  # 验证环境
+python diagnose_fairchem.py          # 诊断 fairchem 安装
+python test/test_mp_structures.py y  # 完整集成测试
 ```
 
 ## 如何接入真实 EquiformerV2 / OCP 代理
@@ -79,6 +140,8 @@ python main.py --mode baseline --obs-mode image
   - 用多个检查点构成 `self.models`，取均值/方差；支持批量推理。
 - 强化 hash：符号 + 四舍五入坐标 + adsorbate id，确保重复状态命中缓存。
 - 将 `oracle_energy_fn` 绑定 EquiformerV2（或 OC20/OC22 查表），`OracleWrapper` 自动写回缓存。
+
+将模型下载到checkpoints，模型下载链接：https://dl.fbaipublicfiles.com/opencatalystproject/models/2023_06/oc20/s2ef/eq2_83M_2M.pt
 
 ## 环境与策略注意点
 - image 模式：默认 CNN policy；最快实现路径。
