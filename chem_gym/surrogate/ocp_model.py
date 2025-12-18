@@ -1,245 +1,179 @@
 import torch
 import numpy as np
-from pathlib import Path
 from ase import Atoms
-import sys
-import warnings
+from ase.constraints import FixAtoms
+from ase.optimize import LBFGS
+from copy import deepcopy
+from typing import Optional, List, Union
 
-# 忽略 torch.load 的 Future warning
-warnings.filterwarnings("ignore", category=FutureWarning)
-
-# --- 动态寻找 Fairchem 导入路径 ---
-FAIRCHEM_AVAILABLE = False
-AtomsToGraphs = None
-registry = None
-Batch = None
-
+# 尝试导入 fairchem-core (新版 OCP)
 try:
-    # 1. 尝试导入基础依赖
-    from torch_geometric.data import Batch
-    
-    # 2. 尝试导入 Registry
-    try:
-        from fairchem.core.common.registry import registry
-    except ImportError:
-        try:
-            from fairchem.core.registry import registry
-        except ImportError:
-            print("Warning: Could not find 'registry' in fairchem.core")
-
-    # 3. 关键修复：显式导入模型以触发注册 (Registry)
-    # 必须显式导入 fairchem.core.models，否则 registry 会是空的
-    try:
-        import fairchem.core.models
-        # [新增] 显式导入 equiformer_v2 模块以触发注册
-        # 某些版本的 fairchem 不会在导入 models 时自动导入所有子模块，导致 registry 为空
-        import fairchem.core.models.equiformer_v2
-    except Exception as e_models:
-        print(f"Warning: 'import fairchem.core.models' failed: {e_models}")
-        # 备选：尝试导入具体模型文件
-        try:
-            from fairchem.core.models import equiformer_v2
-        except Exception as e_eq2:
-            print(f"Warning: Failed to import equiformer_v2 specifically: {e_eq2}")
-
-    # 4. 尝试导入 AtomsToGraphs
-    # 既然之前的诊断脚本没找到，我们这里尽可能尝试所有可能的路径
-    try:
-        # Path A: 标准路径
-        from fairchem.core.preprocessing import AtomsToGraphs
-    except ImportError:
-        try:
-            # Path B: 兼容路径
-            from fairchem.core.datasets import AtomsToGraphs
-        except ImportError:
-            try:
-                # Path C: 顶层
-                import fairchem.core
-                if hasattr(fairchem.core, "AtomsToGraphs"):
-                    AtomsToGraphs = fairchem.core.AtomsToGraphs
-                # Path D: 可能是 common.utils?
-                elif hasattr(fairchem.core.common, "utils") and hasattr(fairchem.core.common.utils, "AtomsToGraphs"):
-                    AtomsToGraphs = fairchem.core.common.utils.AtomsToGraphs
-            except ImportError:
-                pass
-
-    if registry is not None and AtomsToGraphs is not None:
-        FAIRCHEM_AVAILABLE = True
-
-except ImportError as e:
-    print(f"Warning: Failed to import OCP dependencies: {e}")
-
+    from fairchem.core.common.relaxation.ase_utils import OCPCalculator
+except ImportError:
+    raise ImportError("请安装 fairchem-core: `pip install fairchem-core`")
 
 class EquiformerV2Oracle:
-    def __init__(self, checkpoint_path: str, device: str = "cuda"):
-        if not FAIRCHEM_AVAILABLE:
-            raise ImportError(
-                "Failed to initialize OCP. Ensure 'fairchem-core' is installed properly."
-            )
+    """
+    EquiformerV2 Oracle (S2EF 模式)
+    
+    职责：
+    接收一个初始的 HEA 表面+吸附剂结构，固定金属表面，
+    仅对吸附剂进行'微弛豫' (Mini-Relaxation)，返回优化后的能量。
+    这种方法比直接使用 IS2RE 模型更准确，因为它允许吸附剂寻找局部最优位点。
+    """
+    
+    def __init__(
+        self, 
+        checkpoint_path: str, 
+        device: str = "cuda",
+        fmax: float = 0.05,
+        max_steps: int = 100
+    ):
+        """
+        Args:
+            checkpoint_path: EquiformerV2 S2EF 模型 (.pt) 的路径
+            device: 'cuda' 或 'cpu'
+            fmax: 弛豫收敛阈值 (eV/A)。0.05 是兼顾速度和精度的推荐值。
+            max_steps: 最大弛豫步数。RL 探索阶段 50-100 步通常足够。
+        """
+        self.device = device if torch.cuda.is_available() else "cpu"
+        self.fmax = fmax
+        self.max_steps = max_steps
 
-        self.device = torch.device(device) if torch.cuda.is_available() else torch.device("cpu")
-        self.checkpoint_path = checkpoint_path
-        
-        print(f"Loading EquiformerV2 from {checkpoint_path} to {self.device}...")
-        
+        print(f"Loading EquiformerV2 S2EF from {checkpoint_path}...")
+
+        # 初始化 OCP 计算器
+        # 尝试多个可能的参数名以兼容不同版本的 fairchem/ocp-models
         try:
-            # 加载 Checkpoint
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-
-            # --- [FIX] 加载 Normalizers (均值和标准差) ---
-            self.energy_mean = 0.0
-            self.energy_std = 1.0
-
-            if "normalizers" in checkpoint:
-                # 新的OCP格式使用 'target' 作为键名
-                if "target" in checkpoint["normalizers"]:
-                    normalizers = checkpoint["normalizers"]["target"]
-                    self.energy_mean = normalizers.get("mean", 0.0)
-                    self.energy_std = normalizers.get("std", 1.0)
-                # 旧的格式可能使用 'energy'
-                elif "energy" in checkpoint["normalizers"]:
-                    normalizers = checkpoint["normalizers"]["energy"]
-                    self.energy_mean = normalizers.get("mean", 0.0)
-                    self.energy_std = normalizers.get("std", 1.0)
-
-                # 确保转为 Tensor 并移到 GPU
-                if torch.is_tensor(self.energy_mean):
-                    self.energy_mean = self.energy_mean.to(self.device, dtype=torch.float32)
-                else:
-                    self.energy_mean = torch.tensor(self.energy_mean, dtype=torch.float32, device=self.device)
-
-                if torch.is_tensor(self.energy_std):
-                    self.energy_std = self.energy_std.to(self.device, dtype=torch.float32)
-                else:
-                    self.energy_std = torch.tensor(self.energy_std, dtype=torch.float32, device=self.device)
-
-                print(f"✓ Loaded normalizers: mean={self.energy_mean.item():.4f}, std={self.energy_std.item():.4f}")
-            else:
-                print("⚠ WARNING: No normalizers found in checkpoint! Predictions will be unscaled (wrong).")
-                print("  This usually happens if the checkpoint doesn't contain 'normalizers'.")
-                print("  You may need to find mean/std from model documentation.")
-            # --- [FIX END] ---
-
-            # 处理 Config
-            if "config" in checkpoint:
-                config = checkpoint["config"]
-            else:
-                config = checkpoint.get("args", {})
-
-            # 获取模型名称
-            if "model_attributes" in config:
-                model_name = config["model_attributes"].get("model", config.get("model"))
-                model_args = config["model_attributes"]
-            else:
-                model_name = config.get("model", "equiformer_v2")
-                model_args = config.get("model_args", config)
-
-            # 获取模型类
-            # 注意：这里删除了之前导致 Crash 的 registry.get_model_names() 调试代码
-            try:
-                model_cls = registry.get_model_class(model_name)
-            except Exception as e:
-                # 如果 get_model_class 失败（比如 registry 是空的），我们再抛出错误
-                print(f"CRITICAL: Failed to get model class '{model_name}' from registry.")
-                print("This usually means 'import fairchem.core.models' failed silently.")
-                raise e
-
-            if model_cls is None:
-                raise ValueError(f"Model '{model_name}' not found in registry.")
-                
-            self.model = model_cls(**model_args).to(self.device)
-            
-            # 加载权重
-            state_dict = checkpoint["state_dict"]
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                if k.startswith("module."):
-                    new_state_dict[k[7:]] = v
-                else:
-                    new_state_dict[k] = v
-            
-            self.model.load_state_dict(new_state_dict, strict=False)
-            self.model.eval()
-            
-            # 初始化图转换器
-            self.a2g = AtomsToGraphs(
-                max_neigh=50,
-                radius=6.0,
-                r_energy=False,  # Don't read energy from atoms (we're predicting it)
-                r_forces=False,  # Don't read forces from atoms
-                r_distances=False,
-                r_fixed=True,
+            self.calculator = OCPCalculator(
+                checkpoint=checkpoint_path,
+                cpu=(self.device == "cpu")
             )
-            print("EquiformerV2 loaded successfully!")
-            
+        except TypeError:
+            try:
+                self.calculator = OCPCalculator(
+                    checkpoint_path=checkpoint_path,
+                    cpu=(self.device == "cpu")
+                )
+            except TypeError:
+                # 旧版本可能没有 cpu 参数
+                self.calculator = OCPCalculator(
+                    checkpoint=checkpoint_path
+                )
+        print("EquiformerV2 loaded successfully.")
+
+    def _get_fixed_indices(self, atoms: Atoms) -> List[int]:
+        """
+        获取需要固定的原子索引。
+        逻辑：固定所有 非吸附剂 (Tag != 2) 的原子。
+        """
+        tags = atoms.get_tags()
+        if tags is not None and 2 in tags:
+            # 严格遵循 OCP: Tag 2 是吸附剂，其他(0,1)都固定
+            return [i for i, tag in enumerate(tags) if tag != 2]
+
+        # 回退逻辑：如果没有 Tag，按高度固定底部原子
+        positions = atoms.get_positions()
+        z_coords = positions[:, 2]
+        max_z = np.max(z_coords)
+        cutoff = max_z - 3.0
+
+        fixed_indices = [i for i, z in enumerate(z_coords) if z < cutoff]
+        return fixed_indices
+
+    def compute_energy(self, atoms: Atoms, relax: bool = False) -> float:
+        """
+        [新增接口] 通用能量计算。
+        用途：专门用来算 E_slab (纯表面能量)。
+
+        Args:
+            atoms: 结构对象
+            relax: 是否需要弛豫？
+                   - 对于纯金属 HEA 表面，通常设为 False (单点能) 以节省时间。
+                   - 如果追求极致精度，设为 True。
+        """
+        atoms_calc = deepcopy(atoms)
+        atoms_calc.calc = self.calculator
+
+        if relax:
+            # 如果需要弛豫纯表面 (耗时！)
+            # 这种情况下通常固定底部几层，允许表面一层动
+            # 这里为简单起见，暂不加约束或根据 Z 轴加约束
+            opt = LBFGS(atoms_calc, logfile=None)
+            try:
+                opt.run(fmax=self.fmax, steps=self.max_steps)
+            except:
+                pass
+
+        return atoms_calc.get_potential_energy()
+
+    def predict_ads_energy(self,
+                           atoms_with_ads: Atoms,
+                           slab_energy: float,
+                           gas_reference_energy: float,
+                           return_force: bool = False) -> Union[float, tuple]:
+        """
+        计算吸附能。
+        会自动进行 'Fix Slab + Relax Adsorbate' 操作。
+
+        Args:
+            atoms_with_ads: 表面 + 吸附剂
+            slab_energy: 纯表面的能量 (通过 compute_energy 算出)
+            gas_reference_energy: 气相参考值 (常数)
+            return_force: 是否返回吸附剂最大受力 (用于能量离域化检测)
+
+        Returns:
+            如果 return_force=False: adsorption_energy (eV)
+            如果 return_force=True: (adsorption_energy, max_force) 元组
+        """
+        atoms_calc = deepcopy(atoms_with_ads)
+        atoms_calc.calc = self.calculator
+
+        # 1. 设置约束：固定 HEA 表面，只松弛吸附剂
+        atoms_calc.set_constraint() # 清除旧约束
+        fixed_indices = self._get_fixed_indices(atoms_calc)
+        if fixed_indices:
+            c = FixAtoms(indices=fixed_indices)
+            atoms_calc.set_constraint(c)
+
+        # 2. 运行弛豫 (S2EF)
+        opt = LBFGS(atoms_calc, logfile=None)
+        try:
+            opt.run(fmax=self.fmax, steps=self.max_steps)
         except Exception as e:
-            print(f"Error loading OCP model: {e}")
-            import traceback
-            traceback.print_exc()
-            raise e
+            print(f"Relaxation warning: {e}")
 
-    def predict_energy(self, atoms) -> float:
-        """
-        计算给定原子结构的总能量
+        # 3. 计算最终能量
+        e_total = atoms_calc.get_potential_energy()
 
-        支持 ASE Atoms 和 pymatgen Structure 两种对象
-        """
-        # 如果是 pymatgen Structure，转换为 ASE Atoms
-        ase_atoms = atoms
+        # 4. [新增] 能量离域化检测：获取吸附剂最大受力
+        max_force = 0.0
+        if return_force:
+            forces = atoms_calc.get_forces()
+            tags = atoms_calc.get_tags()
 
-        if hasattr(atoms, 'to_ase_atoms'):
-            ase_atoms = atoms.to_ase_atoms()
-        elif hasattr(atoms, 'get_positions'):
-            # 检查是否是 ASE Atoms
-            pass
+            if tags is not None and 2 in tags:
+                # 获取吸附剂原子的受力 (tag=2)
+                ads_indices = [i for i, t in enumerate(tags) if t == 2]
+                if ads_indices:
+                    ads_forces = forces[ads_indices]
+                    max_force = np.max(np.linalg.norm(ads_forces, axis=1))
+            else:
+                # 回退：如果没有 tags，假设最高的原子是吸附剂
+                positions = atoms_calc.get_positions()
+                z_coords = positions[:, 2]
+                max_z = np.max(z_coords)
+                cutoff = max_z - 3.0
+                ads_indices = [i for i, z in enumerate(z_coords) if z >= cutoff]
+                if ads_indices:
+                    ads_forces = forces[ads_indices]
+                    max_force = np.max(np.linalg.norm(ads_forces, axis=1))
+
+        # 5. 计算吸附能
+        e_ads = e_total - slab_energy - gas_reference_energy
+
+        # 6. 返回结果
+        if return_force:
+            return e_ads, max_force
         else:
-            raise TypeError(f"Unsupported atom structure type: {type(atoms)}")
-
-        # 处理原子标签（tags）：约束设置为0，表面设置为1
-        tags = np.ones(len(ase_atoms), dtype=np.int64)
-
-        # 检查是否有约束属性
-        if hasattr(ase_atoms, 'constraints') and ase_atoms.constraints:
-            for constraint in ase_atoms.constraints:
-                if hasattr(constraint, 'index'):
-                    tags[constraint.index] = 0
-
-        ase_atoms.set_tags(tags)
-
-        data_list = self.a2g.convert_all([ase_atoms], disable_tqdm=True)
-        batch = Batch.from_data_list(data_list).to(self.device)
-
-        with torch.no_grad():
-            output = self.model(batch)
-
-        # --- [FIX] 应用反归一化 ---
-        # 公式: E_real = E_raw * std + mean
-        raw_energy = output["energy"]
-        energy = raw_energy * self.energy_std + self.energy_mean
-        # --- [FIX END] ---
-
-        return energy.item()
-
-if __name__ == "__main__":
-    from ase.build import fcc111
-    try:
-        atoms = fcc111('Cu', size=(4,4,3), vacuum=10.0)
-
-        # Set periodic boundary conditions
-        atoms.set_pbc([True, True, True])
-
-        ckpt = "checkpoints/eq2_83M_2M.pt"
-        if not Path(ckpt).exists():
-             ckpt = "../../checkpoints/eq2_83M_2M.pt"
-
-        if Path(ckpt).exists():
-            oracle = EquiformerV2Oracle(ckpt, device="cuda")
-            e = oracle.predict_energy(atoms)
-            print(f"✓ Test Prediction: {e:.4f} eV")
-            print("✓ EquiformerV2 Oracle is working correctly!")
-        else:
-            print(f"Checkpoint not found at {ckpt}")
-    except Exception as e:
-        import traceback
-        print(f"✗ Test failed: {e}")
-        traceback.print_exc()
+            return e_ads

@@ -32,7 +32,10 @@ def parse_args():
     
     # Oracle params
     parser.add_argument("--oracle-ckpt", type=str, default="checkpoints/eq2_83M_2M.pt", help="Path to OCP checkpoint")
-    
+    parser.add_argument("--oracle-fmax", type=float, default=0.05, help="Oracle 弛豫收敛阈值 (eV/A)")
+    parser.add_argument("--oracle-max-steps", type=int, default=100, help="Oracle 最大弛豫步数")
+    parser.add_argument("--oracle-disable-amp", type=bool, default=True, help="禁用 AMP 提升稳定性")
+
     parser.add_argument("--save-dir", type=Path, default=Path("checkpoints"))
     return parser.parse_args()
 
@@ -44,8 +47,17 @@ def launch_train(args):
         print(f"[Main] Loading real Oracle from {args.oracle_ckpt}...")
         device = "cuda" if torch.cuda.is_available() else "cpu"
         try:
-            eq2_model = EquiformerV2Oracle(args.oracle_ckpt, device=device)
-            real_oracle = eq2_model.predict_energy
+            eq2_model = EquiformerV2Oracle(
+                args.oracle_ckpt,
+                device=device,
+                fmax=args.oracle_fmax,
+                max_steps=args.oracle_max_steps
+            )
+            try :
+                real_oracle = eq2_model.predict_energy
+            except AttributeError:
+                Warning("这里需要修改逻辑以适配新的 EquiformerV2Oracle 接口。")
+                raise ValueError("EquiformerV2Oracle does not have method 'predict_energy'")
         except Exception as e:
             print(f"[Main] Failed to load Oracle: {e}. Running without Oracle.")
             real_oracle = None
@@ -79,6 +91,9 @@ def launch_train(args):
         uncertainty_penalty=args.uncertainty_penalty,
         oracle_threshold=args.oracle_threshold,
         learning_rate=args.learning_rate,
+        oracle_fmax=args.oracle_fmax,
+        oracle_max_steps=args.oracle_max_steps,
+        oracle_disable_amp=args.oracle_disable_amp,
     )
     
     # 4. 开始训练

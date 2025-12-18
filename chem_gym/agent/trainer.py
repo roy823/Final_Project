@@ -51,7 +51,6 @@ class OracleWrapper(gym.Wrapper):
             
         return obs, reward, terminated, truncated, info
 
-
 def make_vec_env(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], train_config: TrainConfig,
                  oracle_energy_fn: Optional[Callable] = None):
     def _make_single():

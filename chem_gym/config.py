@@ -31,6 +31,9 @@ class TrainConfig:
     device: str = "cpu"
     uncertainty_penalty: float = 0.0
     oracle_threshold: Optional[float] = None
+    oracle_fmax: float = 0.05
+    oracle_max_steps: int = 100
+    oracle_disable_amp: bool = True
 
 
 @dataclass
