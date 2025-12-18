@@ -12,20 +12,39 @@ try:
     from ase.build import fcc111
     from ase.visualize.plot import plot_atoms
     from ase import Atoms
+    from ase.calculators.emt import EMT
+    from ase.optimize import BFGS
+    from ase.constraints import FixAtoms
 except ImportError:  # pragma: no cover
     fcc111 = None
     plot_atoms = None
     Atoms = None
+    EMT = None
+    BFGS = None
+    FixAtoms = None
 
 from chem_gym.config import EnvConfig
 
 
 class ChemGymEnv(gym.Env):
     """
-    Gymnasium environment for swapping atoms on an HEA slab.
+    Gymnasium environment for optimizing High-Entropy Alloy (HEA) surfaces.
+    
+    Scientific Improvements:
+    - Active Region: Optimizes top N layers (not just surface) to capture Ligand & Strain effects.
+    - Layer-aware Graph: Node features include layer depth information.
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 4}
+    # 来源: Materials Project / Kittel / ICSD
+    LATTICE_CONSTANTS = {
+        "Pt": 3.92,
+        "Pd": 3.89,
+        "Cu": 3.61,
+        "Ni": 3.52,
+        "Au": 4.08,
+        "Ag": 4.09
+    }
 
     def __init__(self, config: EnvConfig, surrogate=None):
         super().__init__()
@@ -35,14 +54,23 @@ class ChemGymEnv(gym.Env):
 
         self.element_types = config.element_types
         self.n_elements = len(self.element_types)
-        self.n_sites = config.slab_size[0] * config.slab_size[1]
+        
+        # 几何参数
+        self.n_sites_per_layer = config.slab_size[0] * config.slab_size[1]
+        self.n_active_layers = config.n_active_layers
+        
+        # [关键] 活性原子总数 = 每层原子数 * 活性层数
+        self.n_active_atoms = self.n_sites_per_layer * self.n_active_layers
+        
         self.render_mode = config.render_mode
 
-        # 动作空间：任意两点交换
-        self.action_space = spaces.Discrete(self.n_sites * (self.n_sites - 1) // 2)
+        # 动作空间：Active Region 内任意两点交换
+        # 组合数 C(n, 2) = n * (n-1) / 2
+        self.action_space = spaces.Discrete(self.n_active_atoms * (self.n_active_atoms - 1) // 2)
         
         # 观察空间
         if self.config.mode == "image":
+            # Image mode 仅支持可视化最表层，对于多层优化建议使用 Graph mode
             self.observation_space = spaces.Box(
                 low=0.0,
                 high=1.0,
@@ -50,13 +78,31 @@ class ChemGymEnv(gym.Env):
                 dtype=np.float32,
             )
         elif self.config.mode == "graph":
+            # 总原子数 = 每层原子数 * 总层数
+            self.n_total_atoms = self.n_sites_per_layer * self.config.n_layers
+            
+            # 节点特征维度: 
+            # 1. One-Hot Element (N_elements)
+            # 2. Relative Pos (3)
+            # 3. Layer Index (1) -> [新增] 明确告知网络原子的深度
+            self.node_feat_dim = self.n_elements + 3 + 1
+
             self.observation_space = spaces.Dict(
                 {
                     "node_features": spaces.Box(
-                        low=0.0, high=1.0, shape=(self.n_sites, self.n_elements), dtype=np.float32
+                        low=-100.0, high=100.0,
+                        shape=(self.n_total_atoms, self.node_feat_dim), 
+                        dtype=np.float32
                     ),
                     "adjacency": spaces.Box(
-                        low=0.0, high=1.0, shape=(self.n_sites, self.n_sites), dtype=np.float32
+                        low=0.0, high=1.0,
+                        shape=(self.n_total_atoms, self.n_total_atoms), 
+                        dtype=np.float32
+                    ),
+                    "node_mask": spaces.Box(
+                        low=0.0, high=1.0,
+                        shape=(self.n_total_atoms,),
+                        dtype=np.float32
                     ),
                 }
             )
@@ -66,11 +112,11 @@ class ChemGymEnv(gym.Env):
         self.state = None
         self.atoms = None
         
-        # 状态追踪变量
         self.initial_energy = 0.0
-        self.prev_energy = 0.0  # 新增：用于计算差分奖励
+        self.prev_energy = 0.0
         self.current_energy = 0.0
         self.current_uncertainty = 0.0
+        self.min_energy_so_far = 0.0 # [新增] 记录本回合最低能量
         self.steps = 0
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict] = None):
@@ -78,10 +124,10 @@ class ChemGymEnv(gym.Env):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
 
-        # --- FIX: 固定成分，随机洗牌 (Stoichiometry Control) ---
-        # 确保每种元素的数量尽可能相等，而不是随机抽取
-        n_base = self.n_sites // self.n_elements
-        remainder = self.n_sites % self.n_elements
+        # --- Stoichiometry Control (Active Region) ---
+        # 确保 Active Region 内每种元素的数量尽可能相等
+        n_base = self.n_active_atoms // self.n_elements
+        remainder = self.n_active_atoms % self.n_elements
         
         base_state = []
         for i in range(self.n_elements):
@@ -89,15 +135,17 @@ class ChemGymEnv(gym.Env):
             base_state.extend([i] * count)
             
         self.state = np.array(base_state, dtype=np.int32)
-        self.rng.shuffle(self.state) # 仅打乱位置
-        # ---------------------------------------------------
+        self.rng.shuffle(self.state)
+        # -----------------------------
 
         self.steps = 0
+        self.atoms = None 
         self.atoms = self._build_atoms_from_state()
 
         self.initial_energy, self.current_uncertainty = self._evaluate_energy(self.atoms)
         self.current_energy = self.initial_energy
-        self.prev_energy = self.initial_energy # 初始化上一轮能量
+        self.prev_energy = self.initial_energy
+        self.min_energy_so_far = self.initial_energy # [新增] 初始化最低能量
 
         observation = self._state_to_observation()
         info = {
@@ -110,7 +158,25 @@ class ChemGymEnv(gym.Env):
     def step(self, action: int):
         i, j = self._action_to_indices(action)
         
-        # 执行交换
+        # [新增] 检查是否交换了相同的元素 (无效动作)
+        # 如果交换前后状态不变，直接给予小惩罚并跳过昂贵的能量计算
+        if self.state[i] == self.state[j]:
+            reward = -0.5 # 给予小惩罚，避免 Agent 偷懒
+            self.steps += 1
+            truncated = self.steps >= self.config.max_steps
+            
+            # 状态未变，无需重新计算能量
+            info = {
+                "energy": self.current_energy,
+                "uncertainty": self.current_uncertainty,
+                "swapped_sites": (i, j),
+                "energy_improvement": 0.0,
+                "atoms": self.atoms
+            }
+            # 观察值也不变，直接返回当前的观察
+            return self._state_to_observation(), reward, False, truncated, info
+
+        # 执行交换 (在 Active Region 内)
         self.state[i], self.state[j] = self.state[j], self.state[i]
         self.steps += 1
 
@@ -118,17 +184,25 @@ class ChemGymEnv(gym.Env):
         self.atoms = self._build_atoms_from_state()
         self.current_energy, self.current_uncertainty = self._evaluate_energy(self.atoms)
 
-        # --- FIX: 差分奖励 (Differential Reward) ---
-        # 奖励 = 能量降低量 = 上一步能量 - 当前能量
+        # --- 奖励函数 ---
         energy_diff = self.prev_energy - self.current_energy
-        reward = energy_diff - self.config.step_penalty
+        reward = (energy_diff * 10.0) - self.config.step_penalty
         
-        # 更新历史
+        # [新增] 打破记录奖励 (Record Breaking Reward)
+        # 如果找到了比历史最低能量更低的构型，给予额外的大奖励
+        if self.current_energy < self.min_energy_so_far:
+            improvement = self.min_energy_so_far - self.current_energy
+            reward += improvement * 50.0 # 给予额外的大奖励
+            self.min_energy_so_far = self.current_energy
+
         self.prev_energy = self.current_energy
-        # -------------------------------------------
 
         terminated = False
         truncated = self.steps >= self.config.max_steps
+        
+        if self.current_energy > 5.0: # 物理异常检测
+            reward -= 10.0
+            terminated = True
 
         observation = self._state_to_observation()
         info = {
@@ -136,7 +210,7 @@ class ChemGymEnv(gym.Env):
             "uncertainty": self.current_uncertainty,
             "swapped_sites": (i, j),
             "energy_improvement": self.initial_energy - self.current_energy,
-            "atoms": self.atoms  # <--- [关键修复] 必须传递 atoms 给 OracleWrapper 使用
+            "atoms": self.atoms
         }
         return observation, reward, terminated, truncated, info
 
@@ -145,8 +219,9 @@ class ChemGymEnv(gym.Env):
             return None
 
         if plot_atoms is None or self.atoms is None:
-            return np.reshape(self.state, self.config.slab_size)
+            return None
 
+        # 渲染时旋转视角以便观察侧面（分层结构）
         fig = plot_atoms(self.atoms, show_unit_cell=0, rotation='-90x')
         if self.render_mode == "human":
             return fig
@@ -159,11 +234,15 @@ class ChemGymEnv(gym.Env):
 
     # --- 内部辅助函数 ---
     def _action_to_indices(self, action: int) -> Tuple[int, int]:
+        # 解码动作：将单一整数 action 映射为 (i, j) 交换对
+        # 适用于任意大小的 n_active_atoms
         if action < 0 or action >= self.action_space.n:
             raise ValueError(f"Action {action} out of bounds")
         remaining = action
-        for i in range(self.n_sites - 1):
-            span = self.n_sites - i - 1
+        # 遍历所有可能的第一个原子 i
+        for i in range(self.n_active_atoms - 1):
+            # i 之后的原子都可以作为 j
+            span = self.n_active_atoms - i - 1
             if remaining < span:
                 return i, i + 1 + remaining
             remaining -= span
@@ -171,33 +250,138 @@ class ChemGymEnv(gym.Env):
 
     def _state_to_observation(self):
         if self.config.mode == "image":
-            flat_one_hot = np.eye(self.n_elements, dtype=np.float32)[self.state]
+            # Image mode 只取最表层 (Active Region 的最后一部分)
+            # 注意：state 是扁平的 Active Region，最表层在最后
+            surface_state = self.state[-self.n_sites_per_layer:]
+            flat_one_hot = np.eye(self.n_elements, dtype=np.float32)[surface_state]
             grid = flat_one_hot.reshape(self.config.slab_size[0], self.config.slab_size[1], self.n_elements)
             return grid
+            
+        if self.atoms is None:
+            return {
+                "node_features": np.zeros((self.n_total_atoms, self.node_feat_dim), dtype=np.float32),
+                "adjacency": np.zeros((self.n_total_atoms, self.n_total_atoms), dtype=np.float32),
+                "node_mask": np.zeros((self.n_total_atoms,), dtype=np.float32)
+            }
+            
+        symbols = self.atoms.get_chemical_symbols()
+        positions = self.atoms.get_positions().astype(np.float32)
+        n_total = len(symbols)
 
-        node_features = np.eye(self.n_elements, dtype=np.float32)[self.state]
-        adjacency = np.ones((self.n_sites, self.n_sites), dtype=np.float32) - np.eye(self.n_sites, dtype=np.float32)
-        return {"node_features": node_features, "adjacency": adjacency}
+        # 1. 节点特征构建
+        pos_center = positions.mean(axis=0, keepdims=True)
+        rel_pos = positions - pos_center
+
+        node_features = np.zeros((n_total, self.node_feat_dim), dtype=np.float32)
+        node_mask = np.ones((n_total,), dtype=np.float32)
+
+        for i, sym in enumerate(symbols):
+            # One-Hot Encoding
+            one_hot = np.zeros((self.n_elements,), dtype=np.float32)
+            if sym in self.element_types:
+                one_hot[self.element_types.index(sym)] = 1.0
+            
+            # [科学改进] Layer Index
+            # ASE fcc111 从底向上构建，每层 n_sites_per_layer 个原子
+            # Layer 0 是最底层，Layer (n_layers-1) 是最表层
+            layer_idx = i // self.n_sites_per_layer
+            
+            # Concat: [OneHot, RelPos, LayerIndex]
+            node_features[i] = np.concatenate([one_hot, rel_pos[i], [float(layer_idx)]])
+
+        # 2. 邻接矩阵构建 (RBF)
+        dist = self.atoms.get_all_distances(mic=True).astype(np.float32)
+        cutoff = float(self.config.graph_cutoff)
+        sigma = float(self.config.graph_sigma)
+        if sigma <= 0: sigma = 1.0
+
+        adjacency = np.zeros_like(dist, dtype=np.float32)
+        mask = (dist > 0) & (dist <= cutoff)
+        adjacency[mask] = np.exp(- (dist[mask] / sigma) ** 2)
+        np.fill_diagonal(adjacency, 1.0)
+
+        return {
+            "node_features": node_features, 
+            "adjacency": adjacency, 
+            "node_mask": node_mask
+        }
 
     def _build_atoms_from_state(self):
+        """
+        根据 Active Region 的状态构建 ASE Atoms 对象。
+        """
         if fcc111 is None:
             return None
         
         if self.atoms is None:
-             self.atoms = fcc111("Cu", size=(self.config.slab_size[0], self.config.slab_size[1], 3), a=3.6, vacuum=7.0)
+            # Vegard's Law 计算平均晶格常数
+            current_elements = [self.element_types[i] for i in self.state]
+            avg_lattice_constant = float(np.mean([
+                self.LATTICE_CONSTANTS.get(el, 3.7) for el in current_elements
+            ]))
+            
+            self.atoms = fcc111(
+                "Cu", 
+                size=(self.config.slab_size[0], self.config.slab_size[1], self.config.n_layers), 
+                a=avg_lattice_constant, 
+                vacuum=10.0
+            )
+
+            # [关键] 固定非 Active Region 的原子
+            if FixAtoms is not None:
+                n_total = len(self.atoms)
+                # Active Region 在顶部，所以固定底部 (n_total - n_active_atoms) 个原子
+                n_fixed = n_total - self.n_active_atoms
+                if n_fixed > 0:
+                    constraint = FixAtoms(indices=range(n_fixed))
+                    self.atoms.set_constraint(constraint)
         
-        symbols = self.atoms.get_chemical_symbols()
-        # 仅更新最上层表面原子
-        start_idx = len(symbols) - self.n_sites
-        new_surface_symbols = [self.element_types[idx] for idx in self.state]
+        # 更新 Active Region 的化学符号
+        # Active Region 对应 atoms 列表的最后 n_active_atoms 个元素
+        n_total = len(self.atoms)
+        start_idx = n_total - self.n_active_atoms
         
-        for k, sym in enumerate(new_surface_symbols):
+        new_symbols = [self.element_types[idx] for idx in self.state]
+        
+        for k, sym in enumerate(new_symbols):
             self.atoms[start_idx + k].symbol = sym
+            
         return self.atoms
 
     def _evaluate_energy(self, atoms: Optional["Atoms"]):
-        if self.surrogate is None:
-            # 如果没有代理模型，返回一个伪能量（仅用于测试）
-            pseudo_energy = float(np.mean(self.state)) 
-            return pseudo_energy, 0.0
-        return self.surrogate.evaluate(atoms)
+        if atoms is None:
+            return 0.0, 0.0
+
+        if self.surrogate is not None:
+            return self.surrogate.evaluate(atoms)
+        
+        if EMT is not None:
+            try:
+                calc_atoms = atoms.copy()
+                calc_atoms.calc = EMT()
+                
+                # [新增] 预检查：如果初始排斥力太大，直接放弃弛豫，视为极差构型
+                # 这能避免 Voronoi 报错和原子跑飞
+                raw_energy = calc_atoms.get_potential_energy()
+                if raw_energy > 100.0: # 阈值可调，100 eV 说明原子严重重叠
+                    return 10.0, 0.0 # 返回一个固定的惩罚值
+
+                if BFGS is not None:
+                    # [修改] 增加 logfile=None 减少 I/O，限制步数防止跑飞
+                    dyn = BFGS(calc_atoms, logfile=None) 
+                    dyn.run(fmax=0.5, steps=20) # 稍微增加步数到 20
+                
+                potential_energy = calc_atoms.get_potential_energy()
+                energy_per_atom = potential_energy / len(calc_atoms)
+                
+                # [新增] 再次检查结果是否合理
+                if energy_per_atom > 5.0 or energy_per_atom < -10.0:
+                     return 5.0, 0.0
+
+                return energy_per_atom, 0.0
+            except Exception as e:
+                print(f"Warning: EMT calculation failed: {e}")
+                # 失败时返回惩罚值，而不是 0.0 (0.0 会被误认为是好状态)
+                return 5.0, 0.0 
+
+        return 0.0, 0.0
