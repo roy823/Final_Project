@@ -9,7 +9,7 @@ except ImportError as exc:  # pragma: no cover
     raise ImportError("gymnasium is required for ChemGymEnv") from exc
 
 try:
-    from ase.build import fcc111
+    from ase.build import fcc111, bulk
     from ase.visualize.plot import plot_atoms
     from ase import Atoms
     from ase.calculators.emt import EMT
@@ -46,10 +46,12 @@ class ChemGymEnv(gym.Env):
         "Ag": 4.09
     }
 
-    def __init__(self, config: EnvConfig, surrogate=None):
+    def __init__(self, config: EnvConfig, surrogate=None, oracle=None):
         super().__init__()
         self.config = config
         self.surrogate = surrogate
+        self.oracle = oracle
+
         self.rng = np.random.default_rng(config.init_seed)
 
         self.element_types = config.element_types
@@ -118,6 +120,29 @@ class ChemGymEnv(gym.Env):
         self.current_uncertainty = 0.0
         self.min_energy_so_far = 0.0 # [新增] 记录本回合最低能量
         self.steps = 0
+        # 参考能量 (校准用)
+        self.ref_energies = {}
+        if self.oracle is not None:
+            self._calibrate_references()
+
+    def _calibrate_references(self):
+        """
+        使用 Oracle 计算纯金属的体相能量 (Bulk Energy)。
+        这是计算生成能 (Formation Energy) 的基准。
+        """
+        print("[ChemGymEnv] Calibrating reference energies with Oracle...")
+        for elem in self.element_types:
+            # 构建纯金属体相 (使用 ASE 默认晶格常数或自定义)
+            # 注意：EquiformerV2 是 S2EF 模型，通常对 Bulk 也能给出合理的能量趋势
+            atoms = bulk(elem, 'fcc', a=self.LATTICE_CONSTANTS.get(elem, 3.8))
+            
+            # 计算能量 (开启弛豫以获得最稳态)
+            # 注意：这里假设 oracle.compute_energy 支持 relax=True
+            total_energy = self.oracle.compute_energy(atoms, relax=True)
+            
+            # 存储单原子能量
+            self.ref_energies[elem] = total_energy / len(atoms)
+            print(f"   -> {elem} Bulk Energy: {self.ref_energies[elem]:.4f} eV/atom")
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict] = None):
         super().reset(seed=seed)
@@ -186,13 +211,19 @@ class ChemGymEnv(gym.Env):
 
         # --- 奖励函数 ---
         energy_diff = self.prev_energy - self.current_energy
-        reward = (energy_diff * 10.0) - self.config.step_penalty
+        # 1. 大幅放大能量差信号 (从 200 增加到 1000)
+        # 这样 0.001 eV 的改进就能带来 +1.0 的奖励
+        reward = energy_diff * 1000.0
         
-        # [新增] 打破记录奖励 (Record Breaking Reward)
-        # 如果找到了比历史最低能量更低的构型，给予额外的大奖励
+        # 2. 移除固定的 step_penalty，改为只对“无改进”的步数进行微小惩罚
+        if energy_diff <= 0:
+            reward -= 0.01  # 极小的惩罚，迫使它寻找更好的构型
+            
+        # 3. 引入“历史新低”额外奖励 (Record Breaking Bonus)
         if self.current_energy < self.min_energy_so_far:
-            improvement = self.min_energy_so_far - self.current_energy
-            reward += improvement * 50.0 # 给予额外的大奖励
+            # 只要打破了本局的最低能量记录，就额外给奖励
+            bonus = (self.min_energy_so_far - self.current_energy) * 2000.0
+            reward += bonus
             self.min_energy_so_far = self.current_energy
 
         self.prev_energy = self.current_energy
@@ -327,6 +358,17 @@ class ChemGymEnv(gym.Env):
                 vacuum=10.0
             )
 
+            # Tag 0: 固定的体相/底层原子
+            # Tag 1: 自由的表面原子 (Active Region)
+            # Tag 2: 吸附剂 (本场景无)
+            tags = np.zeros(len(self.atoms), dtype=int)
+            
+            # 标记 Active Region 为 1
+            n_total = len(self.atoms)
+            start_idx = n_total - self.n_active_atoms
+            tags[start_idx:] = 1
+            self.atoms.set_tags(tags)
+
             # [关键] 固定非 Active Region 的原子
             if FixAtoms is not None:
                 n_total = len(self.atoms)
@@ -338,6 +380,7 @@ class ChemGymEnv(gym.Env):
         
         # 更新 Active Region 的化学符号
         # Active Region 对应 atoms 列表的最后 n_active_atoms 个元素
+        # self.atoms.set_positions(self.ideal_positions)
         n_total = len(self.atoms)
         start_idx = n_total - self.n_active_atoms
         
@@ -351,6 +394,27 @@ class ChemGymEnv(gym.Env):
     def _evaluate_energy(self, atoms: Optional["Atoms"]):
         if atoms is None:
             return 0.0, 0.0
+
+        if self.oracle is not None:
+            try:
+                # 1. 计算总能 (relax=True 允许局部弛豫)
+                e_total = self.oracle.compute_energy(atoms, relax=False)
+                
+                # 2. 计算参考能总和
+                composition = atoms.get_chemical_symbols()
+                e_ref_total = 0.0
+                for sym in composition:
+                    e_ref_total += self.ref_energies.get(sym, 0.0)
+                
+                # 3. 计算生成能 (Formation Energy per atom)
+                # E_form = (E_total - E_refs) / N
+                formation_energy = (e_total - e_ref_total) / len(atoms)
+                
+                return formation_energy, 0.0 # Uncertainty 暂设为 0
+            except Exception as e:
+                print(f"Oracle calculation failed: {e}")
+                return 5.0, 0.0
+
 
         if self.surrogate is not None:
             return self.surrogate.evaluate(atoms)

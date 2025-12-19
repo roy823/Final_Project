@@ -2,7 +2,9 @@ from typing import Callable, Optional
 
 import gymnasium as gym
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize # [新增] 引入 VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, SubprocVecEnv
+from stable_baselines3.common.callbacks import BaseCallback  # 新增导入
+from stable_baselines3.common.callbacks import CallbackList
 
 from chem_gym.config import EnvConfig, TrainConfig
 from chem_gym.envs.chem_env import ChemGymEnv
@@ -51,11 +53,31 @@ class OracleWrapper(gym.Wrapper):
             
         return obs, reward, terminated, truncated, info
 
+class EnergyLoggerCallback(BaseCallback):
+    """
+    自定义回调函数：每隔指定步数打印一次当前能量
+    """
+    def __init__(self, verbose=0, log_freq=10):
+        super().__init__(verbose)
+        self.log_freq = log_freq
+
+    def _on_step(self) -> bool:
+        # n_calls 是总步数。我们只在特定频率打印
+        if self.n_calls % self.log_freq == 0:
+            # 从 VecEnv 的 info 中获取能量
+            # 因为是向量化环境，infos 是一个列表
+            infos = self.locals.get("infos", [])
+            if infos:
+                energy = infos[0].get("energy", "N/A")
+                reward = self.locals.get("rewards")[0]
+                print(f"[Step {self.n_calls}] Energy: {energy:.4f} eV/atom | Reward: {reward:.4f}")
+        return True
+
 def make_vec_env(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], train_config: TrainConfig,
-                 oracle_energy_fn: Optional[Callable] = None):
+                 oracle_energy_fn: Optional[Callable] = None, oracle=None):
     def _make_single():
         # 这里 surrogate 可能是 None，ChemGymEnv 会自动处理回退到 EMT
-        env = ChemGymEnv(env_config, surrogate=surrogate)
+        env = ChemGymEnv(env_config, surrogate=surrogate, oracle=oracle)
         
         # 只有当 surrogate 存在时，才需要考虑不确定性惩罚和 Oracle 调用
         if surrogate is not None:
@@ -80,8 +102,9 @@ def make_vec_env(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], 
 
 
 def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], train_config: TrainConfig,
-                oracle_energy_fn: Optional[Callable] = None):
-    vec_env = make_vec_env(env_config, surrogate, train_config, oracle_energy_fn)
+                oracle_energy_fn: Optional[Callable] = None, oracle=None):
+    vec_env = make_vec_env(env_config, surrogate, train_config, oracle_energy_fn, oracle=oracle)
+
     
     # 策略网络选择
     policy_kwargs = {}
@@ -110,16 +133,28 @@ def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], t
         device=train_config.device,
         # 开启 Tensorboard 日志，用于观察物理能量曲线
         n_steps=2048, # [建议] 增加采样步数，让梯度更稳
-        batch_size=64,
-        clip_range=0.1, # [建议] 限制更新幅度
-        ent_coef=0.01, # [建议] 增加探索
+        batch_size=128,
+        clip_range=0.2, # [建议] 限制更新幅度
+        ent_coef=0.001, # [建议] 增加探索
         tensorboard_log="./chem_gym_tensorboard/"
     )
     vis_callback = VisualizationCallback(save_freq=50, save_dir="./vis_results")
-    model.learn(total_timesteps=train_config.total_timesteps, progress_bar=True, callback=vis_callback)
+    energy_callback = EnergyLoggerCallback(log_freq=5) # 每 5 步打印一次
     
-    # [新增] 保存 VecNormalize 的统计数据 (均值和方差)
-    # 否则加载模型时无法还原真实的奖励尺度
+    # 使用 CallbackList 包装
+    callbacks = CallbackList([vis_callback, energy_callback])
+
+    print(f"Starting training for {train_config.total_timesteps} steps...")
+    
+    # [关键修改：只调用一次 learn]
+    model.learn(
+        total_timesteps=train_config.total_timesteps, 
+        progress_bar=True, 
+        callback=callbacks
+    )
+    # ------------------------------
+
+    # 保存模型和归一化参数
     model.save("ppo_chem_gym")
     vec_env.save("vec_normalize.pkl")
     
