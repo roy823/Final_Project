@@ -42,3 +42,26 @@ class SurrogateConfig:
     seeds: Optional[List[int]] = None  # None -> range(n_models)
     mean_energy: float = -1.0
     noise_scale: float = 0.1
+
+
+@dataclass
+class AdsorptionConfig:
+    """吸附能优化专用配置"""
+    # 吸附剂参数
+    adsorbate: str = "CO"  # CO, O2, H2, NO
+    target_ads_energy: float = -0.5  # 目标吸附能(eV)
+    energy_tolerance: float = 0.1    # 允许偏差
+
+    # 物理参数
+    gas_reference_energy: float = -1.0  # 气相参考能
+    adsorbate_height: float = 2.0       # 初始吸附高度(Å)
+    adsorption_site: str = "fcc"        # 吸附位点类型: fcc, hcp, bridge
+
+    # Oracle配置
+    use_oracle_directly: bool = True    # 直接使用EquiformerV2
+    cache_enabled: bool = True          # 启用吸附能缓存
+    enable_relaxation: bool = True      # 启用Oracle自动弛豫
+
+    # 奖励权重
+    target_reward_weight: float = 10.0
+    proximity_reward_weight: float = 1.0

@@ -72,18 +72,17 @@ class OracleWrapper(gym.Wrapper):
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-
+        
         # 只有在 surrogate 存在时才有意义进行主动学习
         current_uncertainty = info.get("uncertainty", 0.0)
-
+        
         if current_uncertainty > self.threshold:
             oracle_energy = self.oracle_energy_fn(info.get("atoms"))
             # 更新 surrogate 缓存
             self.surrogate.update_with_oracle(info.get("atoms"), oracle_energy)
             info["oracle_energy"] = oracle_energy
-
+            
         return obs, reward, terminated, truncated, info
-
 
 class EnergyLoggerCallback(BaseCallback):
     """
@@ -150,7 +149,6 @@ class AdsorptionEnergyLoggerCallback(BaseCallback):
         print(f"Target hit rate: {target_hit_rate:.2f}%")
         print(f"=======================\n")
 
-
 def make_vec_env(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], train_config: TrainConfig,
                  oracle_energy_fn: Optional[Callable] = None, oracle=None, ads_config: Optional[AdsorptionConfig] = None,
                  use_adsorption_env: bool = False):
@@ -177,23 +175,21 @@ def make_vec_env(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], 
 
     # 1. 创建基础向量化环境
     env = DummyVecEnv([_make_single for _ in range(train_config.n_envs)])
-
+    
     # 2. [关键修改] 使用 VecNormalize 归一化观测值和奖励
     # norm_obs=True: 归一化观测值 (对 GNN 输入特征很有帮助)
     # norm_reward=True: 归一化奖励 (解决 explained_variance 低的核心)
     # clip_obs=10.0, clip_reward=10.0: 防止极端值破坏训练
     env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10., clip_reward=10.)
-
+    
     return env
 
 
 def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], train_config: TrainConfig,
-                oracle_energy_fn: Optional[Callable] = None, oracle=None, ads_config: Optional[AdsorptionConfig] = None,
-                use_adsorption_env: bool = False, result_dir: str = "./result", tensorboard_log: str = None,
-                vis_dir: str = None, best_structure_path: str = None):
-    vec_env = make_vec_env(env_config, surrogate, train_config, oracle_energy_fn, oracle=oracle,
-                          ads_config=ads_config, use_adsorption_env=use_adsorption_env)
+                oracle_energy_fn: Optional[Callable] = None, oracle=None):
+    vec_env = make_vec_env(env_config, surrogate, train_config, oracle_energy_fn, oracle=oracle)
 
+    
     # 策略网络选择
     policy_kwargs = {}
 
@@ -207,20 +203,9 @@ def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], t
         )
     else:
         raise ValueError(f"Unsupported mode: {env_config.mode}")
-
-    if use_adsorption_env:
-        print(f"[Trainer] Initializing PPO with adsorption environment")
-        print(f"[Trainer] Adsorbate: {ads_config.adsorbate}, Target: {ads_config.target_ads_energy:.2f} eV")
-    else:
-        print(f"[Trainer] Initializing PPO with standard environment")
-
-    print(f"[Trainer] Policy: {policy}")
-
-    # Use provided paths or defaults
-    tb_log_path = tensorboard_log if tensorboard_log is not None else f"{result_dir}/logs/tensorboard"
-    vis_save_dir = vis_dir if vis_dir is not None else f"{result_dir}/visualizations"
-    best_struct_path = best_structure_path if best_structure_path is not None else f"{result_dir}/structures/best_optimized.xyz"
-
+    
+    print(f"[Trainer] Initializing PPO with policy: {policy}")
+    
     model = PPO(
         policy,
         vec_env,
@@ -235,46 +220,26 @@ def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], t
         batch_size=128,
         clip_range=0.2, # [建议] 限制更新幅度
         ent_coef=0.001, # [建议] 增加探索
-        tensorboard_log=tb_log_path,
+        tensorboard_log="./chem_gym_tensorboard/"
     )
-
-    # Create callbacks
-    callbacks = []
-    vis_callback = VisualizationCallback(save_freq=50, save_dir=vis_save_dir, best_structure_path=best_struct_path)
-    callbacks.append(vis_callback)
-
-    # Use appropriate logger callback
-    if use_adsorption_env:
-        energy_callback = AdsorptionEnergyLoggerCallback(log_freq=5)
-        print(f"[Trainer] Using AdsorptionEnergyLoggerCallback")
-    else:
-        energy_callback = EnergyLoggerCallback(log_freq=5)
-
-    callbacks.append(energy_callback)
-
-    # Use CallbackList to combine all callbacks
-    callback_list = CallbackList(callbacks)
+    vis_callback = VisualizationCallback(save_freq=50, save_dir="./vis_results")
+    energy_callback = EnergyLoggerCallback(log_freq=5) # 每 5 步打印一次
+    
+    # 使用 CallbackList 包装
+    callbacks = CallbackList([vis_callback, energy_callback])
 
     print(f"Starting training for {train_config.total_timesteps} steps...")
-    print(f"[Trainer] TensorBoard log: {tb_log_path}")
-    print(f"[Trainer] Visualizations: {vis_save_dir}")
-
+    
     # [关键修改：只调用一次 learn]
     model.learn(
-        total_timesteps=train_config.total_timesteps,
-        progress_bar=True,
-        callback=callback_list
+        total_timesteps=train_config.total_timesteps, 
+        progress_bar=True, 
+        callback=callbacks
     )
     # ------------------------------
 
     # 保存模型和归一化参数
-    if use_adsorption_env:
-        model.save(f"{result_dir}/models/ppo_adsorption_chem_gym")
-        vec_env.save(f"{result_dir}/models/vec_normalize_adsorption.pkl")
-        print(f"[Trainer] Saved adsorption model to: {result_dir}/models/ppo_adsorption_chem_gym.zip")
-    else:
-        model.save(f"{result_dir}/models/ppo_chem_gym")
-        vec_env.save(f"{result_dir}/models/vec_normalize.pkl")
-        print(f"[Trainer] Model and stats saved to: {result_dir}/models/")
-
+    model.save("ppo_chem_gym")
+    vec_env.save("vec_normalize.pkl")
+    
     return model

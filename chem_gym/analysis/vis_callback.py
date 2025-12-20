@@ -29,11 +29,17 @@ class VisualizationCallback(BaseCallback):
     2. Structure CIF file
     3. Interactive HTML (Plotly 3D)
     """
-    def __init__(self, save_freq: int, save_dir: str, verbose=0):
+    def __init__(self, save_freq: int, save_dir: str, best_structure_path: str = None, verbose=0):
         super().__init__(verbose)
         self.save_freq = save_freq
         self.save_dir = save_dir
+        self.best_structure_path = best_structure_path
+        self.best_energy = float('inf')
         os.makedirs(self.save_dir, exist_ok=True)
+
+        # Create directory for best structure if path is provided
+        if self.best_structure_path is not None:
+            os.makedirs(os.path.dirname(self.best_structure_path), exist_ok=True)
 
     def _on_step(self) -> bool:
         if self.n_calls % self.save_freq == 0:
@@ -41,16 +47,21 @@ class VisualizationCallback(BaseCallback):
             env = self.training_env.envs[0]
             while hasattr(env, 'env'):
                 env = env.env
-            
+
             if hasattr(env, 'atoms') and env.atoms is not None:
                 atoms = env.atoms
                 step = self.num_timesteps
                 energy = env.current_energy if hasattr(env, 'current_energy') else 0.0
-                
+
+                # --- Track best structure ---
+                if self.best_structure_path is not None and energy < self.best_energy:
+                    self.best_energy = energy
+                    write(self.best_structure_path, atoms)
+
                 # --- 1. 保存 CIF 文件 ---
                 cif_path = os.path.join(self.save_dir, f"step_{step:06d}.cif")
                 write(cif_path, atoms)
-                
+
                 # --- 2. 生成交互式 HTML (Plotly) ---
                 if ADVANCED_VIS:
                     html_path = os.path.join(self.save_dir, f"step_{step:06d}.html")
@@ -60,7 +71,7 @@ class VisualizationCallback(BaseCallback):
                 # --- 3. 生成静态 PNG (Matplotlib) ---
                 fig = plt.figure(figsize=(12, 6), dpi=150)
                 gs = GridSpec(1, 2, width_ratios=[1, 1.2])
-                
+
                 # Top View
                 ax_top = fig.add_subplot(gs[0])
                 plot_atoms(atoms, ax_top, radii=0.8, rotation='-90x', show_unit_cell=2)
@@ -70,7 +81,7 @@ class VisualizationCallback(BaseCallback):
                 # Side View
                 ax_side = fig.add_subplot(gs[1])
                 plot_atoms(atoms, ax_side, radii=0.8, rotation='-90x,90y', show_unit_cell=0)
-                
+
                 # Active Region Boundary
                 positions = atoms.get_positions()
                 z_max = positions[:, 2].max()
@@ -78,7 +89,7 @@ class VisualizationCallback(BaseCallback):
                 active_depth = env.n_active_layers * layer_spacing
                 active_boundary = z_max - active_depth + (layer_spacing * 0.5)
                 ax_side.axvline(x=active_boundary, color='red', linestyle='--', alpha=0.5)
-                
+
                 ax_side.set_title(f"Side View (Active: {env.n_active_layers})", fontsize=12, fontweight='bold')
                 ax_side.axis('off')
 
@@ -95,5 +106,5 @@ class VisualizationCallback(BaseCallback):
                 png_path = os.path.join(self.save_dir, f"step_{step:06d}.png")
                 plt.savefig(png_path, bbox_inches='tight')
                 plt.close(fig)
-                
+
         return True
