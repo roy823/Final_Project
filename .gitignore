@@ -3,6 +3,7 @@ chem_gym_tensorboard/
 
 # 忽略可视化生成的结果文件
 vis_results/
+checkpoints/
 
 # 忽略 Python 缓存
 __pycache__/
