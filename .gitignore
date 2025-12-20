@@ -1,9 +1,17 @@
-__pycache__/
-*.pyc
-.DS_Store
-.vscode/
-# 如果你的模型文件超过 100MB，必须忽略它，否则推送会失败
-checkpoints/
+# 忽略强化学习训练生成的 TensorBoard 日志
+chem_gym_tensorboard/
 
-CLAUDE.md
-.claude
+# 忽略可视化生成的结果文件
+vis_results/
+
+# 忽略 Python 缓存
+__pycache__/
+*.py[cod]
+
+# 忽略保存的模型文件（如果不想上传的话）
+*.zip
+*.pkl
+
+# 忽略最佳构型输出
+best_optimized.xyz
+best_structure.html

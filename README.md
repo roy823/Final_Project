@@ -1,161 +1,116 @@
-# Chem-Gym：用于高熵合金表面的代理辅助主动强化学习
+# Chem-Gym: 基于 EquiformerV2 代理模型的高熵合金 (HEA) 表面优化框架
 
-面向课程大作业的完整框架，包含环境 (A)、代理集成 (B)、策略与主动学习 (C)，并以 EquiformerV2 作为高保真“Oracle”。
+## 📖 项目背景
+高熵合金（High-Entropy Alloys, HEA）因其独特的“鸡尾酒效应”在催化领域展现出巨大潜力。然而，HEA 表面原子的排列组合空间极其庞大（对于一个 32 原子的体系，二元合金的排列数约为 $10^8$，五元合金则超过 $10^{18}$）。
 
-## 目录结构与职责
-- `chem_gym/__init__.py`：包入口，导出 `ChemGymEnv`、`SurrogateEnsemble`。
-- `chem_gym/envs/chem_env.py`（模块 A：环境）：
-  - Gymnasium 环境；两种观测：
-    - `image`：`(H, W, N_elements)` one-hot 网格，适合 CNN/MLP 策略。
-    - `graph`：节点特征 + 邻接矩阵占位（可扩展为边索引/距离，供 GNN 策略）。
-  - 动作：离散交换两格（`n_sites*(n_sites-1)/2`），映射在 `_action_to_indices`。
-  - 奖励：`-(E_t - E_0) - step_penalty`，步数达 `max_steps` 截断。
-  - 状态 → ASE `Atoms`（fcc(111)），`render` 调用 `plot_atoms`。
-  - `surrogate.evaluate(atoms)` 输出能量与不确定度。
-- `chem_gym/surrogate/ensemble.py`（模块 B：代理集成）：
-  - 集成 + 缓存：hash(符号+坐标) 避免重复推理。
-  - `evaluate` 返回 (均值能量, 方差)；`update_with_oracle` 写入高保真标签（主动学习）。
-  - 待替换为 OCP 预训练（GemNet-OC/PaiNN 快速代理 + EquiformerV2 高保真 Oracle）。
-- `chem_gym/agent/trainer.py`（模块 C：策略与主动学习）：
-  - `TrainConfig`：PPO 超参 + `uncertainty_penalty`、`oracle_threshold`。
-  - 包装器：`UncertaintyPenaltyWrapper`（奖励扣 sigma），`OracleWrapper`（sigma>阈值触发 Oracle，写回缓存）。
-  - `make_vec_env` 构建矢量化环境；`train_agent` 运行 PPO（image 用 CNN，graph 可换自定义 GNN）。
-- `chem_gym/active_learning.py`：轻量回放、Oracle 触发、缓存更新工具。
-- `chem_gym/baselines.py`：随机搜索、模拟退火基线。
-- `main.py`：CLI 运行 PPO 或基线，Oracle 钩子占位。
-- `requirements.txt`：依赖列表（含 EquiformerV2 所需堆栈）。
+**Chem-Gym** 是一个将深度强化学习（DRL）与最先进的原子尺度模型（EquiformerV2）相结合的框架，旨在通过智能搜索而非穷举法，寻找热力学最稳定的 HEA 表面构型。
 
-## 深度学习设计（思路与目的）
-- 目标：在固定 HEA 表面上通过最少代理调用获得最低吸附能；利用不确定度驱动主动学习。
-- 代理集成（速度+稳健）：
-  - 快速模型：3–5 个 GemNet-OC/PaiNN 检查点组成深度集成，输出均值与 std 作为 (E_hat, σ)。
-  - 高保真 Oracle：EquiformerV2 作为慢模型，仅在 sigma 超阈值时调用，写回缓存以降低不确定度。
-- 数据集选择与清洗：
-  - 来源：OC20/OC22。筛选目标元素（如 Cu/Ni/Pt/Pd/Au）和少量吸附物（*H, *CO）。
-  - 规模：几千到一两万条子集，便于小规模微调/线下推理；可保留验证集作为 Oracle 查表。
-  - 预处理：去除缺失坐标/异常能量；标准化晶格；记录 adsorbate 标签用于 hash。
-- 训练/推理策略：
-  - 代理微调：可对最后 MLP 头进行轻量微调以适配子集；不同随机种子/检查点提升不确定度质量。
-  - 批量推理：在矢量化环境中合批多个 Atoms 送入模型，降低 kernel 启动开销。
-  - 缓存：基于符号+位置(+吸附物) 的稳定 hash，重复状态直接返回 (E, σ=0)。
-- 不确定度与主动学习：
-  - 奖励塑形：`R = -(E_t - E_0) - λ·σ - step_penalty`，鼓励低能且低不确定度。
-  - Oracle 触发：`sigma > tau` 时调用 EquiformerV2/查表，将能量写入缓存（sigma→0），形成闭环。
-  - 统计：记录 sigma 分布、Oracle 触发频次、缓存命中率，以证明主动学习有效。
-- 策略与基线：
-  - 主算法：PPO (on-policy) 先跑通 image 模式；graph 模式可换自定义 GNN policy。
-  - 基线：随机搜索、模拟退火，作为对比曲线（能量 vs 代理调用数）。
+---
 
-## 数据与模型流
-1) 环境状态 -> ASE `Atoms` slab（可控元素比例、随机置换）。
-2) 代理集成 -> (能量均值, sigma)；缓存命中则 O(1) 返回。
-3) PPO 策略接收观测（image/graph），奖励包含能量与不确定度项。
-4) 主动学习：sigma 超阈值触发 EquiformerV2/查表，缓存更新，sigma 下降。
+## 🛠️ 技术架构
 
-## 快速开始
+项目遵循“环境-代理-预言机”三层架构：
 
-### 1. 安装依赖
+1.  **环境 (chem_gym/envs/chem_env.py)**: 
+    - 基于 Gymnasium 接口。
+    - 负责维护原子坐标、执行原子交换动作、计算生成能。
+    - 支持 `graph`（图神经网络）和 `image`（多通道网格）两种观测模式。
+2.  **代理 (chem_gym/agent/trainer.py)**:
+    - 使用 Stable Baselines3 的 PPO 算法。
+    - 集成了自定义的 `CrystalGraphFeatureExtractor`，能够识别晶体结构的局部配位环境。
+3.  **预言机 (chem_gym/surrogate/ocp_model.py)**:
+    - 封装了 Open Catalyst Project (OCP) 的 **EquiformerV2** 模型。
+    - 提供高精度的能量预测和结构弛豫功能。
 
-#### 基础依赖（CPU 可用，推荐 GPU）：
+---
+
+## 🚀 安装与配置
+
+### 1. 核心依赖
 ```bash
-pip install -r requirements.txt
+pip install fairchem-core torch-geometric stable-baselines3 gymnasium ase pymatgen plotly
 ```
 
-#### OCP/EquiformerV2 支持（需要 GPU）：
+### 2. 下载预训练权重
+项目默认使用 EquiformerV2 (83M 参数) 模型：
 ```bash
-# 安装 fairchem 包（EquiformerV2）
-pip install fairchem-core torch-geometric
-
-# 下载 EquiformerV2 检查点
 mkdir -p checkpoints
 wget https://dl.fbaipublicfiles.com/opencatalystproject/models/2023_06/oc20/s2ef/eq2_83M_2M.pt -O checkpoints/eq2_83M_2M.pt
 ```
 
-#### Materials Project 支持（可选）：
-```bash
-# 用于下载真实晶体结构
-pip install pymatgen
+---
 
-# 设置你的 Materials Project API 密钥
-export MP_API_KEY="your_api_key_here"
-# 你可以在 https://materialsproject.org/api 获取免费 API 密钥
+## 🧪 物理原理详解
+
+### 生成能 (Formation Energy) 计算
+为了消除体系大小和元素种类的影响，我们计算每原子的生成能：
+$$E_{form} = \frac{E_{slab} - \sum_{i} n_i \mu_i}{N}$$
+其中：
+- $E_{slab}$ 是由 `EquiformerV2Oracle` 计算的总能。
+- $\mu_i$ 是元素 $i$ 在纯金属体相（Bulk）中的化学势。
+- 环境在启动时会自动调用 `_calibrate_references` 函数，使用相同的 Oracle 模型计算所有元素的 $\mu_i$，确保能量基准的一致性。
+
+### 奖励函数塑形 (Reward Shaping)
+为了引导 Agent 在巨大的搜索空间中快速收敛，我们设计了复合奖励：
+1.  **能量差奖励**：$1000 \times (E_{t-1} - E_t)$，即能量每下降 0.001 eV，奖励 +1.0。
+2.  **记录突破奖励**：当 Agent 找到本轮训练中的最低能量构型时，给予双倍奖励。
+3.  **无效动作惩罚**：交换相同元素或能量上升时给予微小惩罚。
+
+---
+
+## 🤖 强化学习优化策略
+
+### 1. 熵减量调度 (Entropy Decay)
+在训练初期，我们设置较高的 `ent_coef`（如 0.01）鼓励 Agent 尝试各种排列。随着训练进行，`EntropyDecayCallback` 会线性降低熵系数，迫使 Agent 在后期锁定已发现的最优物理规律。
+
+### 2. 观测值归一化 (VecNormalize)
+由于 GNN 提取的特征值范围波动较大，我们使用了 `VecNormalize` 包装器。它能实时计算观测值的均值和方差并进行归一化，这对于稳定 PPO 的 `explained_variance` 指标至关重要。
+
+---
+
+## 💻 使用指南
+
+### 训练模型
+针对 3 层活性层（48 个原子）的复杂体系：
+```bash
+python main.py --mode train \
+  --obs-mode graph \
+  --n-active-layers 3 \
+  --total-steps 100000 \
+  --learning-rate 3e-4 \
+  --device cuda
 ```
 
-### 2. 运行训练
-
-#### PPO 训练（使用图像观测）：
+### 评估与推理 (Greedy Quench)
+加载训练好的模型，进行 200 步的随机采样优化，并实时保存最优构型：
 ```bash
-python main.py --mode train --obs-mode image --total-steps 5000
+python main.py --mode eval --n-active-layers 3
 ```
 
-#### PPO 训练（带不确定度惩罚和 Oracle）：
+### 交互式可视化
+使用 `advanced_vis.py` 生成可缩放、可旋转的 3D 结构图：
 ```bash
-python main.py --mode train --obs-mode image \
-  --uncertainty-penalty 0.05 \
-  --oracle-threshold 0.3 \
-  --oracle-ckpt checkpoints/eq2_83M_2M.pt
+python3 -c "from ase.io import read; from chem_gym.analysis.advanced_vis import plot_structure_plotly; atoms = read('best_optimized.xyz'); plot_structure_plotly(atoms, 'Optimized HEA Structure', 'best_structure.html')"
 ```
 
-#### 多环境并行训练：
-```bash
-python main.py --mode train --obs-mode image --n-envs 4 --device cuda
-```
+---
 
-### 3. 运行基线
-```bash
-python main.py --mode baseline --obs-mode image
-```
+## 📈 监控与分析
 
-### 4. 测试 Materials Project 结构
+建议使用 TensorBoard 监控以下关键指标：
+- **`rollout/ep_rew_mean`**: 奖励是否稳步上升。
+- **`train/explained_variance`**: 核心指标。若该值 > 0.5，说明 Agent 已经理解了原子排列与能量之间的物理联系。
+- **`train/entropy_loss`**: 观察熵是否按照预期下降。
 
-我们提供了测试脚本，用于验证 EquiformerV2 在真实材料结构上的预测能力：
+---
 
-```bash
-# 测试 EquiformerV2 Oracle（需要 API 密钥）
-MP_API_KEY="your_api_key" python test/test_mp_structures.py y
+## 🗺️ 路线图 (Roadmap)
+- [x] 集成 EquiformerV2 作为 Oracle。
+- [x] 实现基于生成能的奖励机制。
+- [x] 引入熵减量回调函数。
+- [ ] **多组分扩展**：支持 5 元及以上的高熵合金体系。
+- [ ] **吸附能优化**：引入 CO/H 等吸附质，直接优化催化活性位点。
+- [ ] **主动学习**：当模型不确定度高时，自动触发高精度 DFT 计算。
 
-# 测试 SurrogateEnsemble（快速测试，随机预测）
-python test/test_mp_structures.py
-```
-
-测试脚本会自动：
-1. 检查本地是否已有结构文件（`mp_structures/`）
-2. 如果没有，自动从 Materials Project 下载
-3. 使用指定的模型预测能量
-4. 输出每原子能量和总结
-
-### 5. 验证环境安装
-
-运行以下脚本检查环境配置：
-```bash
-python check_envs.py                  # 验证环境
-python diagnose_fairchem.py          # 诊断 fairchem 安装
-python test/test_mp_structures.py y  # 完整集成测试
-```
-
-## 如何接入真实 EquiformerV2 / OCP 代理
-- 在 `surrogate/ensemble.py` 中实现：
-  - `load_ocp_model(cfg, ckpt, device)`：加载 EquiformerV2/GemNet-OC。
-  - `ocp_predict(atoms)`：ASE `Atoms` -> OCP 图（节点/边/距离 + adsorbate 标签），前向得到能量。
-  - 用多个检查点构成 `self.models`，取均值/方差；支持批量推理。
-- 强化 hash：符号 + 四舍五入坐标 + adsorbate id，确保重复状态命中缓存。
-- 将 `oracle_energy_fn` 绑定 EquiformerV2（或 OC20/OC22 查表），`OracleWrapper` 自动写回缓存。
-
-将模型下载到checkpoints，模型下载链接：https://dl.fbaipublicfiles.com/opencatalystproject/models/2023_06/oc20/s2ef/eq2_83M_2M.pt
-
-## 环境与策略注意点
-- image 模式：默认 CNN policy；最快实现路径。
-- graph 模式：扩展邻接为边索引/距离，接入自定义 GNN policy（可继承 SB3 ActorCriticPolicy，或换 d3rlpy/CQL/IQL）。
-- 奖励：可调 `step_penalty` 与 `uncertainty_penalty`；截断在 `max_steps`。
-- 可视化：`render` 生成 PNG/GIF 用于展示。
-
-## 实施优先级
-1) 补充 `requirements.txt`：`ocp-torch`, `ocp-models`, `tensorboard`, `rich`。
-2) 在 `ensemble.py` 接 EquiformerV2/GemNet-OC 推理 + 稳定 hash + 批量化。
-3) 扩展 graph 观测为边索引/距离，接入 GNN policy。
-4) 打开 TensorBoard 日志，记录能量/σ/Oracle 触发/缓存命中。
-5) 评测脚本：能量 vs 代理调用、sigma 衰减、随机/SA/PPO 对比；渲染优化后的表面。
-
-## 价值与可行性
-- EquiformerV2 提供高保真 Oracle，GemNet-OC/PaiNN 作为快速代理，配合缓存显著减少调用次数。
-- 主动学习闭环利用 sigma 触发高精度评估，提升策略可靠性；image 模式快速出结果，graph+GNN 可在最终报告展示更高物理保真度。
+--- 
+**日期**: 2025年12月20日
