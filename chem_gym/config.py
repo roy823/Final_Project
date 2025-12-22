@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 @dataclass
 class EnvConfig:
     mode: str = "image"  # "image" or "graph"
-    element_types: List[str] = field(default_factory=lambda: [ "Pt", "Ag"])
+    element_types: List[str] = field(default_factory=lambda: [ "Au", "Ag","Cu"])
     slab_size: Tuple[int, int] = (4, 4) 
     n_layers: int = 4                   # Slab 总厚度层数
     n_active_layers: int = 3            # 允许优化的顶部层数 (Active Region)
