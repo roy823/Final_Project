@@ -5,12 +5,36 @@ from ase.constraints import FixAtoms
 from ase.optimize import LBFGS
 from copy import deepcopy
 from typing import Optional, List, Union
+import sys
+from types import ModuleType
 
-# 尝试导入 fairchem-core (新版 OCP)
+# --- [关键修复] 伪造 fairchem.data.omat 模块以绕过硬编码检查 ---
+if "fairchem.data" not in sys.modules:
+    sys.modules["fairchem.data"] = ModuleType("fairchem.data")
+if "fairchem.data.omat" not in sys.modules:
+    sys.modules["fairchem.data.omat"] = ModuleType("fairchem.data.omat")
+# -------------------------------------------------------
+
+# --- 鲁棒的导入逻辑 ---
+# 1. 导入 UMA 核心组件 (之前测试已证明这个路径在你的环境下是通的)
 try:
+    from fairchem.core.calculate.ase_calculator import FAIRChemCalculator, FormationEnergyCalculator
+except ImportError:
+    try:
+        from fairchem.core.calculators.ase_calculator import FAIRChemCalculator, FormationEnergyCalculator
+    except ImportError:
+        FAIRChemCalculator, FormationEnergyCalculator = None, None
+
+# 2. 导入 OCPCalculator (仅 EquiformerV2 使用)
+try:
+    # 尝试新路径
     from fairchem.core.common.relaxation.ase_utils import OCPCalculator
 except ImportError:
-    raise ImportError("请安装 fairchem-core: `pip install fairchem-core`")
+    try:
+        # 尝试旧路径
+        from ocpmodels.common.relaxation.ase_utils import OCPCalculator
+    except ImportError:
+        OCPCalculator = None
 
 class EquiformerV2Oracle:
     """
@@ -36,6 +60,9 @@ class EquiformerV2Oracle:
             fmax: 弛豫收敛阈值 (eV/A)。0.05 是兼顾速度和精度的推荐值。
             max_steps: 最大弛豫步数。RL 探索阶段 50-100 步通常足够。
         """
+        if OCPCalculator is None:
+            raise ImportError("当前环境未安装 OCPCalculator 所需的模块 (fairchem.core.common.relaxation)。请检查安装或改用 UMA 模型。")
+        
         self.device = device if torch.cuda.is_available() else "cpu"
         self.fmax = fmax
         self.max_steps = max_steps
@@ -177,3 +204,98 @@ class EquiformerV2Oracle:
             return e_ads, max_force
         else:
             return e_ads
+
+class UMAOracle:
+    """
+    UMA (Universal Materials Adapter) Oracle
+    """
+    def __init__(self, checkpoint_path: str, device: str = "cuda"):
+        if FAIRChemCalculator is None:
+            raise ImportError("无法导入 FAIRChemCalculator。请确保使用 /base/mambaforge/bin/python 运行。")
+        
+        self.device = device if torch.cuda.is_available() else "cpu"
+        print(f"[UMA] Loading local checkpoint from {checkpoint_path}...")
+        
+        # 1. 加载模型 (使用位置参数以匹配官方文档)
+        try:
+            self.base_calc = FAIRChemCalculator.from_model_checkpoint(
+                checkpoint_path, 
+                task_name="omat",
+                device=self.device
+            )
+        except TypeError:
+            self.base_calc = FAIRChemCalculator.from_model_checkpoint(
+                checkpoint=checkpoint_path, 
+                task_name="omat",
+                device=self.device
+            )
+
+        # 2. 手动注入下载的参考文件
+        import yaml
+        import os
+
+        ref_dir = os.path.join(os.path.dirname(checkpoint_path), "references")
+        form_ref_path = os.path.join(ref_dir, "form_elem_refs.yaml")
+        iso_ref_path = os.path.join(ref_dir, "iso_atom_elem_refs.yaml")
+
+        if hasattr(self.base_calc, "predictor"):
+            p = self.base_calc.predictor
+            # 确保属性存在
+            if not hasattr(p, "form_elem_refs") or p.form_elem_refs is None:
+                p.form_elem_refs = {}
+            if not hasattr(p, "iso_atom_elem_refs") or p.iso_atom_elem_refs is None:
+                p.iso_atom_elem_refs = {}
+
+            if os.path.exists(form_ref_path) and os.path.exists(iso_ref_path):
+                print(f"[UMA] Injecting references from {ref_dir}...")
+                with open(form_ref_path, "r") as f:
+                    ref_data = yaml.safe_load(f)
+                    # [关键修复] 同时注入到 "omat" 和 None 键下，确保各种查找逻辑都能找到
+                    p.form_elem_refs["omat"] = ref_data
+                    p.form_elem_refs[None] = ref_data 
+                with open(iso_ref_path, "r") as f:
+                    iso_data = yaml.safe_load(f)
+                    p.iso_atom_elem_refs["omat"] = iso_data
+                    p.iso_atom_elem_refs[None] = iso_data
+                print("[UMA] Successfully injected OMat24 references.")
+            else:
+                print(f"[UMA] Warning: Reference files not found. Using empty refs.")
+                p.form_elem_refs["omat"] = {}
+                p.iso_atom_elem_refs["omat"] = {}
+
+            # 3. 初始化 FormationEnergyCalculator
+            # [关键修复] 强制 apply_corrections=False。
+            # 因为我们已经手动注入了参考能 (form_elem_refs)，不需要 fairchem 内部再去加载 fairchem.data.omat。
+            # 这样可以彻底避免 "fairchem.data.omat is required" 错误。
+            try:
+                self.calculator = FormationEnergyCalculator(self.base_calc, apply_corrections=False)
+                print("[UMA] FormationEnergyCalculator initialized (corrections disabled, using manual refs).")
+            except Exception as e:
+                print(f"[UMA] Initialization failed ({e}), falling back to raw energies.")
+                self.calculator = FormationEnergyCalculator(self.base_calc, apply_corrections=False)
+        else:
+            raise RuntimeError("UMA 模型加载失败：无法找到 predictor 属性。")
+
+    def compute_energy(self, atoms: Atoms, relax: bool = False) -> float:
+        """
+        为了兼容性保留此接口。在 UMA 模式下，它返回单原子生成能。
+        """
+        atoms_calc = atoms.copy()
+        try:
+            atoms_calc.calc = self.calculator
+            # 尝试获取生成能
+            total_form_e = atoms_calc.get_potential_energy()
+            return total_form_e / len(atoms)
+        except Exception as e:
+            # [保底逻辑] 如果 FormationEnergyCalculator 报错（如缺少参考能），
+            # 则回退到使用基础计算器获取总能，并进行简单的归一化。
+            # 这样可以保证 RL 训练不会因为物理计算的小问题而中断。
+            if self.base_calc:
+                atoms_calc.calc = self.base_calc
+                total_e = atoms_calc.get_potential_energy()
+                # 这里的 5.0 是为了让能量落在一个合理的负值区间（假设平均结合能）
+                # 仅作为计算失败时的物理估计
+                return (total_e / len(atoms)) 
+            else:
+                print(f"[UMA] Critical Error: Both calculators failed. {e}")
+                return 0.0

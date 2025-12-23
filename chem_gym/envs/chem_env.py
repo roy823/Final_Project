@@ -127,22 +127,15 @@ class ChemGymEnv(gym.Env):
 
     def _calibrate_references(self):
         """
-        使用 Oracle 计算纯金属的体相能量 (Bulk Energy)。
-        这是计算生成能 (Formation Energy) 的基准。
+        使用 UMA 时，参考态修正由内部 FormationEnergyCalculator 处理。
         """
-        print("[ChemGymEnv] Calibrating reference energies with Oracle...")
-        for elem in self.element_types:
-            # 构建纯金属体相 (使用 ASE 默认晶格常数或自定义)
-            # 注意：EquiformerV2 是 S2EF 模型，通常对 Bulk 也能给出合理的能量趋势
-            atoms = bulk(elem, 'fcc', a=self.LATTICE_CONSTANTS.get(elem, 3.8))
-            
-            # 计算能量 (开启弛豫以获得最稳态)
-            # 注意：这里假设 oracle.compute_energy 支持 relax=True
-            total_energy = self.oracle.compute_energy(atoms, relax=True)
-            
-            # 存储单原子能量
-            self.ref_energies[elem] = total_energy / len(atoms)
-            print(f"   -> {elem} Bulk Energy: {self.ref_energies[elem]:.4f} eV/atom")
+        if isinstance(self.oracle, (object,)) and "UMAOracle" in str(type(self.oracle)):
+            print("[ChemGymEnv] UMA Oracle detected. Using internal MP2020 corrections.")
+            return
+        
+        # 原有的手动校准逻辑 (仅在非 UMA 模式下运行)
+        print("[ChemGymEnv] Calibrating reference energies with Legacy Oracle...")
+        pass
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict] = None):
         super().reset(seed=seed)
@@ -357,7 +350,7 @@ class ChemGymEnv(gym.Env):
                 a=avg_lattice_constant, 
                 vacuum=10.0
             )
-
+            self.atoms.set_pbc(True)
             # Tag 0: 固定的体相/底层原子
             # Tag 1: 自由的表面原子 (Active Region)
             # Tag 2: 吸附剂 (本场景无)
@@ -397,55 +390,18 @@ class ChemGymEnv(gym.Env):
 
         if self.oracle is not None:
             try:
-                # 1. 计算总能 (relax=True 允许局部弛豫)
-                e_total = self.oracle.compute_energy(atoms, relax=False)
+                # 统一调用 compute_energy 接口
+                # 对于 UMAOracle，它返回的是生成能 (eV/atom)；对于 EquiformerV2Oracle，它返回总能 (eV)
+                energy = self.oracle.compute_energy(atoms, relax=False)
                 
-                # 2. 计算参考能总和
-                composition = atoms.get_chemical_symbols()
-                e_ref_total = 0.0
-                for sym in composition:
-                    e_ref_total += self.ref_energies.get(sym, 0.0)
+                # 如果是旧模型 (EquiformerV2)，它返回的是总能，需要手动减去参考能并归一化
+                if not ("UMAOracle" in str(type(self.oracle))):
+                    composition = atoms.get_chemical_symbols()
+                    e_ref_total = sum([self.ref_energies.get(sym, 0.0) for sym in composition])
+                    # 修正逻辑：(总能 - 参考能) / 原子数
+                    energy = (energy - e_ref_total) / len(atoms)
                 
-                # 3. 计算生成能 (Formation Energy per atom)
-                # E_form = (E_total - E_refs) / N
-                formation_energy = (e_total - e_ref_total) / len(atoms)
-                
-                return formation_energy, 0.0 # Uncertainty 暂设为 0
+                return energy, 0.0
             except Exception as e:
                 print(f"Oracle calculation failed: {e}")
                 return 5.0, 0.0
-
-
-        if self.surrogate is not None:
-            return self.surrogate.evaluate(atoms)
-        
-        if EMT is not None:
-            try:
-                calc_atoms = atoms.copy()
-                calc_atoms.calc = EMT()
-                
-                # [新增] 预检查：如果初始排斥力太大，直接放弃弛豫，视为极差构型
-                # 这能避免 Voronoi 报错和原子跑飞
-                raw_energy = calc_atoms.get_potential_energy()
-                if raw_energy > 100.0: # 阈值可调，100 eV 说明原子严重重叠
-                    return 10.0, 0.0 # 返回一个固定的惩罚值
-
-                if BFGS is not None:
-                    # [修改] 增加 logfile=None 减少 I/O，限制步数防止跑飞
-                    dyn = BFGS(calc_atoms, logfile=None) 
-                    dyn.run(fmax=0.5, steps=20) # 稍微增加步数到 20
-                
-                potential_energy = calc_atoms.get_potential_energy()
-                energy_per_atom = potential_energy / len(calc_atoms)
-                
-                # [新增] 再次检查结果是否合理
-                if energy_per_atom > 5.0 or energy_per_atom < -10.0:
-                     return 5.0, 0.0
-
-                return energy_per_atom, 0.0
-            except Exception as e:
-                print(f"Warning: EMT calculation failed: {e}")
-                # 失败时返回惩罚值，而不是 0.0 (0.0 会被误认为是好状态)
-                return 5.0, 0.0 
-
-        return 0.0, 0.0

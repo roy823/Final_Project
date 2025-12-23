@@ -43,12 +43,16 @@ def parse_args():
 
 
 def launch_train(args):
-    # 1. 初始化 Oracle (Equiformer V2)
+    # 1. 初始化 Oracle (支持 UMA 或 EquiformerV2)
     eq2_model = None
-    real_oracle = None
-    if args.oracle_ckpt and Path(args.oracle_ckpt).exists():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    if args.oracle_ckpt and ("uma" in args.oracle_ckpt.lower()):
+        print(f"[Main] Initializing UMA Oracle from {args.oracle_ckpt}...")
+        from chem_gym.surrogate.ocp_model import UMAOracle
+        eq2_model = UMAOracle(checkpoint_path=args.oracle_ckpt, device=device)
+    elif args.oracle_ckpt and Path(args.oracle_ckpt).exists():
         print(f"[Main] Loading real Oracle from {args.oracle_ckpt}...")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
         try:
             eq2_model = EquiformerV2Oracle(
                 args.oracle_ckpt,
@@ -62,7 +66,7 @@ def launch_train(args):
             eq2_model = None
     else:
         print(f"[Main] Oracle checkpoint not found at {args.oracle_ckpt}. Running without Oracle.")
-        real_oracle = None
+        eq2_model = None # 确保这里也是 eq2_model
 
     env_config = EnvConfig(
         mode=args.obs_mode, 
@@ -97,19 +101,15 @@ def launch_train(args):
         oracle_disable_amp=args.oracle_disable_amp,
     )
     
-    # 4. 开始训练
-    print(f"[Main] Starting training on {train_config.device}...")
-    model = train_agent(
-        env_config, 
-        surrogate, 
-        train_config, 
-        oracle_energy_fn=real_oracle, 
-        oracle=eq2_model
+    # 4. 启动训练
+    train_agent(
+        env_config=env_config,
+        train_config=train_config,
+        surrogate=surrogate,
+        oracle_energy_fn=eq2_model, # [关键修复] 将 real_oracle 改为 eq2_model
+        oracle=eq2_model,
+        save_dir=args.save_dir
     )
-    
-    args.save_dir.mkdir(parents=True, exist_ok=True)
-    model.save(args.save_dir / "ppo_chem_gym.zip")
-    print(f"Model saved to {args.save_dir}")
 
 
 def launch_baselines(args):

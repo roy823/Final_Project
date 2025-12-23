@@ -102,7 +102,7 @@ def make_vec_env(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], 
 
 
 def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], train_config: TrainConfig,
-                oracle_energy_fn: Optional[Callable] = None, oracle=None):
+                oracle_energy_fn: Optional[Callable] = None, oracle=None, save_dir: str = "."):
     vec_env = make_vec_env(env_config, surrogate, train_config, oracle_energy_fn, oracle=oracle)
 
     
@@ -154,8 +154,15 @@ def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], t
     )
     # ------------------------------
 
-    # 保存模型和归一化参数
-    model.save("ppo_chem_gym")
-    vec_env.save("vec_normalize.pkl")
+    # 保存模型和归一化参数到指定目录
+    import os
+    os.makedirs(save_dir, exist_ok=True)
+    
+    model_path = os.path.join(save_dir, "ppo_chem_gym")
+    stats_path = os.path.join(save_dir, "vec_normalize.pkl")
+    
+    print(f"[Trainer] Saving model to {model_path}...")
+    model.save(model_path)
+    vec_env.save(stats_path)
     
     return model
