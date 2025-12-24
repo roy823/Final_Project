@@ -4,8 +4,8 @@ from tqdm import tqdm
 
 # 1. 切换到镜像站地址
 BASE_URL = "https://hf-mirror.com/facebook/UMA/resolve/main"
-# 2. 您的 Token (镜像站作为透明代理通常也需要它来验证受限模型权限)
-TOKEN = "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"
+
+
 # 官方要求的参考文件
 files = {
     f"{BASE_URL}/references/form_elem_refs.yaml": "checkpoints/references/form_elem_refs.yaml",
