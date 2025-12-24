@@ -173,6 +173,18 @@ class ChemGymEnv(gym.Env):
         }
         return observation, info
 
+    def action_masks(self) -> np.ndarray:
+        """
+        计算动作掩码：如果交换的两个原子元素相同，则该动作为非法 (False)。
+        返回: 布尔数组，形状为 (n_actions,)
+        """
+        mask = np.ones(self.action_space.n, dtype=bool)
+        for action in range(self.action_space.n):
+            i, j = self._action_to_indices(action)
+            if self.state[i] == self.state[j]:
+                mask[action] = False
+        return mask
+        
     def step(self, action: int):
         i, j = self._action_to_indices(action)
         

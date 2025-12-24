@@ -70,17 +70,20 @@ $$E_{form} = \frac{E_{slab} - \sum_{i} n_i \mu_i}{N}$$
 
 ## 💻 使用指南
 
+### 进入工作区
+```bash
+cd /root/shared-nvme/ChemGymProject
+```
+
 ### 训练模型
 针对 3 层活性层（48 个原子）的复杂体系：
 ```bash
-python main.py --mode train \
-  --obs-mode graph \
-  --n-active-layers 3 \
-  --total-steps 100000 \
-  --learning-rate 3e-4 \
-  --device cuda
+/base/mambaforge/bin/python main.py     --mode train     --oracle-ckpt checkpoints/uma-s-1p1.pt     --obs-mode graph     --total-steps 60000     --n-active-layers 3     --learning-rate 1e-4     --device cuda 
 ```
-
+### 查看TensorBoard
+```bash
+tensorboard --logdir ./chem_gym_tensorboard/
+```
 ### 评估与推理 (Greedy Quench)
 加载训练好的模型，进行 200 步的随机采样优化，并实时保存最优构型：
 ```bash

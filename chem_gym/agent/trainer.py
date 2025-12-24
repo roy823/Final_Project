@@ -5,6 +5,10 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, SubprocVecEnv
 from stable_baselines3.common.callbacks import BaseCallback  # 新增导入
 from stable_baselines3.common.callbacks import CallbackList
+# 导入 MaskablePPO 及其配套组件
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.maskable.utils import get_action_masks
+from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 
 from chem_gym.config import EnvConfig, TrainConfig
 from chem_gym.envs.chem_env import ChemGymEnv
@@ -120,9 +124,10 @@ def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], t
     else:
         raise ValueError(f"Unsupported mode: {env_config.mode}")
     
-    print(f"[Trainer] Initializing PPO with policy: {policy}")
+    print(f"[Trainer] Initializing MaskablePPO with policy: {policy}")
     
-    model = PPO(
+    # 将 PPO 替换为 MaskablePPO
+    model = MaskablePPO(
         policy,
         vec_env,
         policy_kwargs=policy_kwargs,
@@ -147,10 +152,10 @@ def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], t
     print(f"Starting training for {train_config.total_timesteps} steps...")
     
     # [关键修改：只调用一次 learn]
+    # 在训练时，MaskablePPO 会自动调用环境的 action_masks() 方法
     model.learn(
-        total_timesteps=train_config.total_timesteps, 
-        progress_bar=True, 
-        callback=callbacks
+        total_timesteps=train_config.total_timesteps,
+        callback=callbacks,
     )
     # ------------------------------
 
