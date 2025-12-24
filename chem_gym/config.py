@@ -14,7 +14,7 @@ class EnvConfig:
     n_active_layers: int = 3            # 允许优化的顶部层数 (Active Region)
     graph_cutoff: float = 6.0           # 图的截断半径（Å）
     graph_sigma: float = 2.0            # RBF 权重的尺度（Å）
-    max_steps: int = 200                # 适应更大的搜索空间
+    max_steps: int = 800                # 适应更大的搜索空间
     step_penalty: float = 0.01
     init_seed: Optional[int] = None
     render_mode: Optional[str] = None  # "human" or "rgb_array"

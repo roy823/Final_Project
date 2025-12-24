@@ -37,10 +37,10 @@ def parse_args():
     parser.add_argument("--oracle-fmax", type=float, default=0.05, help="Oracle 弛豫收敛阈值 (eV/A)")
     parser.add_argument("--oracle-max-steps", type=int, default=100, help="Oracle 最大弛豫步数")
     parser.add_argument("--oracle-disable-amp", type=bool, default=True, help="禁用 AMP 提升稳定性")
-
+    # [新增] 增加动作掩码开关
+    parser.add_argument("--use-masking", action="store_true", help="使用动作掩码 (MaskablePPO)")
     parser.add_argument("--save-dir", type=Path, default=Path("checkpoints"))
     return parser.parse_args()
-
 
 def launch_train(args):
     # 1. 初始化 Oracle (支持 UMA 或 EquiformerV2)
@@ -106,9 +106,10 @@ def launch_train(args):
         env_config=env_config,
         train_config=train_config,
         surrogate=surrogate,
-        oracle_energy_fn=eq2_model, # [关键修复] 将 real_oracle 改为 eq2_model
+        oracle_energy_fn=eq2_model,
         oracle=eq2_model,
-        save_dir=args.save_dir
+        save_dir=args.save_dir,
+        use_masking=args.use_masking # [新增] 传递开关参数
     )
 
 
@@ -136,89 +137,92 @@ def launch_baselines(args):
 
 
 def launch_eval(args):
-    # 初始化 Oracle (用于获取真实能量)
+    # 1. 初始化 Oracle (支持 UMA 或 EquiformerV2)
     eq2_model = None
-    if args.oracle_ckpt and Path(args.oracle_ckpt).exists():
-        print(f"[Eval] Loading Oracle from {args.oracle_ckpt}...")
-        eq2_model = EquiformerV2Oracle(args.oracle_ckpt, device="cuda" if torch.cuda.is_available() else "cpu")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # 环境配置
+    if args.oracle_ckpt and ("uma" in args.oracle_ckpt.lower()):
+        print(f"[Eval] Initializing UMA Oracle from {args.oracle_ckpt}...")
+        from chem_gym.surrogate.ocp_model import UMAOracle
+        eq2_model = UMAOracle(checkpoint_path=args.oracle_ckpt, device=device)
+    elif args.oracle_ckpt and Path(args.oracle_ckpt).exists():
+        print(f"[Eval] Loading Oracle from {args.oracle_ckpt}...")
+        eq2_model = EquiformerV2Oracle(args.oracle_ckpt, device=device)
+    
+    # 2. 环境配置
     env_config = EnvConfig(mode=args.obs_mode, n_active_layers=args.n_active_layers)
     
-    # 创建基础环境 (不带归一化，因为我们要加载保存的归一化参数)
     from chem_gym.envs.chem_env import ChemGymEnv
     from stable_baselines3.common.vec_env import DummyVecEnv
+    from sb3_contrib import MaskablePPO # 导入 MaskablePPO
     
     def _make_single():
         return ChemGymEnv(env_config, oracle=eq2_model)
     
     base_venv = DummyVecEnv([_make_single])
     
-    # 加载归一化统计数据 (均值和方差)
-    stats_path = "vec_normalize.pkl"
-    if Path(stats_path).exists():
+    # 3. 加载归一化统计数据 (优先加载 maskable 版本)
+    stats_path = args.save_dir / "vec_normalize_ppo_maskable.pkl"
+    if not stats_path.exists():
+        stats_path = Path("vec_normalize.pkl")
+
+    if stats_path.exists():
         print(f"[Eval] Loading normalization stats from {stats_path}...")
-        venv = VecNormalize.load(stats_path, base_venv)
-        # 关键：推理模式下关闭统计更新和奖励归一化
+        venv = VecNormalize.load(str(stats_path), base_venv)
         venv.training = False
         venv.norm_reward = False
     else:
-        print(f"[Warning] {stats_path} not found. Using unnormalized environment.")
+        print(f"[Warning] Normalization stats not found. Using unnormalized environment.")
         venv = base_venv
 
-    # 加载 PPO 模型
-    model_path = "ppo_chem_gym.zip"
-    if not Path(model_path).exists():
+    # 4. 加载模型 (优先加载 maskable 版本)
+    model_path = args.save_dir / "ppo_maskable"
+    if not model_path.with_suffix(".zip").exists():
+        model_path = Path("ppo_chem_gym")
+
+    if not model_path.with_suffix(".zip").exists():
         print(f"Error: Model {model_path} not found!")
         return
         
     print(f"[Eval] Loading model from {model_path}...")
-    model = PPO.load(model_path, env=venv)
+    try:
+        model = MaskablePPO.load(model_path, env=venv)
+        is_maskable = True
+        print("Successfully loaded MaskablePPO model.")
+    except Exception:
+        from stable_baselines3 import PPO
+        model = PPO.load(model_path, env=venv)
+        is_maskable = False
+        print("Successfully loaded standard PPO model.")
 
-    # 开始确定性优化过程
+    # 5. 开始优化过程
     obs = venv.reset()
     print("\n" + "="*30)
     print("  STARTING STOCHASTIC OPTIMIZATION  ")
     print("="*30)
     
     best_energy = float('inf')
-    best_atoms = None
-    
-    # 记录已经尝试过的动作，防止死循环
-    attempted_actions = set()
+    from sb3_contrib.common.maskable.utils import get_action_masks
 
-    for step in range(200): # 运行 200 步
-        # --- [关键修改：不要用 deterministic=True] ---
-        # 因为模型还没学稳，我们用随机采样，但增加采样次数
-        action, _ = model.predict(obs, deterministic=False)
-        
-        # 获取当前环境的内部状态（用于检查是否是无效交换）
-        # 注意：venv 是 VecNormalize，需要访问原始环境
-        raw_env = venv.unwrapped.envs[0]
-        i, j = raw_env._action_to_indices(int(action))
-        
-        # 如果交换的是相同元素，或者是已经试过没效果的动作，就重新采样
-        retry = 0
-        while raw_env.state[i] == raw_env.state[j] and retry < 100:
+    for step in range(1000): # 增加到 1000 步
+        if is_maskable:
+            masks = get_action_masks(venv)
+            action, _ = model.predict(obs, action_masks=masks, deterministic=False)
+        else:
             action, _ = model.predict(obs, deterministic=False)
-            i, j = raw_env._action_to_indices(int(action))
-            retry += 1
-
+        
         obs, rewards, dones, infos = venv.step(action)
         current_energy = infos[0]['energy']
         
-        # 打印有意义的进度
-        if step % 10 == 0 or current_energy < best_energy:
-            print(f"Step {step+1:03d} | Energy: {current_energy:.6f} eV/atom | Action: ({i},{j})")
+        if step % 50 == 0 or current_energy < best_energy:
+            print(f"Step {step+1:03d} | Energy: {current_energy:.6f} eV/atom")
         
         if current_energy < best_energy:
             best_energy = current_energy
-            best_atoms = infos[0]['atoms'].copy()
-            best_atoms.write("best_optimized.xyz") # 实时保存最好的
+            infos[0]['atoms'].write("best_optimized.xyz")
 
     print("="*30)
     print(f"Final Best Energy: {best_energy:.6f} eV/atom")
-
 
 
 if __name__ == "__main__":

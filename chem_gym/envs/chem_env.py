@@ -30,8 +30,10 @@ class ChemGymEnv(gym.Env):
     """
     Gymnasium environment for optimizing High-Entropy Alloy (HEA) surfaces.
     
-    Scientific Improvements:
-    - Active Region: Optimizes top N layers (not just surface) to capture Ligand & Strain effects.
+    Evolution:
+    - [v2.0] Action Space: "Element Mutation" + "Global Teleportation".
+             This aligns with GNN's node-classification strength and SA's global search capability.
+    - Active Region: Optimizes top N layers.
     - Layer-aware Graph: Node features include layer depth information.
     """
 
@@ -66,13 +68,15 @@ class ChemGymEnv(gym.Env):
         
         self.render_mode = config.render_mode
 
-        # 动作空间：Active Region 内任意两点交换
-        # 组合数 C(n, 2) = n * (n-1) / 2
-        self.action_space = spaces.Discrete(self.n_active_atoms * (self.n_active_atoms - 1) // 2)
+        # [重大修改] 动作空间重定义：Element Mutation
+        # 旧: 任意两点交换 C(n, 2) -> O(N^2)
+        # 新: 指定位置变为指定元素 -> O(N * K)
+        # 动作 Action = Site_Index * n_elements + Target_Element_Index
+        # 含义: "我希望 Site i 是 Element k"
+        self.action_space = spaces.Discrete(self.n_active_atoms * self.n_elements)
         
-        # 观察空间
+        # 观察空间 (保持不变)
         if self.config.mode == "image":
-            # Image mode 仅支持可视化最表层，对于多层优化建议使用 Graph mode
             self.observation_space = spaces.Box(
                 low=0.0,
                 high=1.0,
@@ -80,13 +84,9 @@ class ChemGymEnv(gym.Env):
                 dtype=np.float32,
             )
         elif self.config.mode == "graph":
-            # 总原子数 = 每层原子数 * 总层数
             self.n_total_atoms = self.n_sites_per_layer * self.config.n_layers
             
-            # 节点特征维度: 
-            # 1. One-Hot Element (N_elements)
-            # 2. Relative Pos (3)
-            # 3. Layer Index (1) -> [新增] 明确告知网络原子的深度
+            # Node Features: [OneHot(N), RelPos(3), LayerIdx(1)]
             self.node_feat_dim = self.n_elements + 3 + 1
 
             self.observation_space = spaces.Dict(
@@ -118,8 +118,9 @@ class ChemGymEnv(gym.Env):
         self.prev_energy = 0.0
         self.current_energy = 0.0
         self.current_uncertainty = 0.0
-        self.min_energy_so_far = 0.0 # [新增] 记录本回合最低能量
+        self.min_energy_so_far = 0.0
         self.steps = 0
+        
         # 参考能量 (校准用)
         self.ref_energies = {}
         if self.oracle is not None:
@@ -127,6 +128,7 @@ class ChemGymEnv(gym.Env):
 
     def _calibrate_references(self):
         """
+        [保持 UMA 逻辑]
         使用 UMA 时，参考态修正由内部 FormationEnergyCalculator 处理。
         """
         if isinstance(self.oracle, (object,)) and "UMAOracle" in str(type(self.oracle)):
@@ -135,7 +137,14 @@ class ChemGymEnv(gym.Env):
         
         # 原有的手动校准逻辑 (仅在非 UMA 模式下运行)
         print("[ChemGymEnv] Calibrating reference energies with Legacy Oracle...")
-        pass
+        for elem in self.element_types:
+             # 为了避免未定义的 self.oracle.compute_energy 报错，这里加个简单保护
+             if hasattr(self.oracle, "compute_energy"):
+                 try:
+                    atoms = bulk(elem, 'fcc', a=self.LATTICE_CONSTANTS.get(elem, 3.8))
+                    total_energy = self.oracle.compute_energy(atoms, relax=True)
+                    self.ref_energies[elem] = total_energy / len(atoms)
+                 except: pass
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict] = None):
         super().reset(seed=seed)
@@ -143,7 +152,6 @@ class ChemGymEnv(gym.Env):
             self.rng = np.random.default_rng(seed)
 
         # --- Stoichiometry Control (Active Region) ---
-        # 确保 Active Region 内每种元素的数量尽可能相等
         n_base = self.n_active_atoms // self.n_elements
         remainder = self.n_active_atoms % self.n_elements
         
@@ -163,7 +171,7 @@ class ChemGymEnv(gym.Env):
         self.initial_energy, self.current_uncertainty = self._evaluate_energy(self.atoms)
         self.current_energy = self.initial_energy
         self.prev_energy = self.initial_energy
-        self.min_energy_so_far = self.initial_energy # [新增] 初始化最低能量
+        self.min_energy_so_far = self.initial_energy
 
         observation = self._state_to_observation()
         info = {
@@ -175,39 +183,68 @@ class ChemGymEnv(gym.Env):
 
     def action_masks(self) -> np.ndarray:
         """
-        计算动作掩码：如果交换的两个原子元素相同，则该动作为非法 (False)。
-        返回: 布尔数组，形状为 (n_actions,)
+        [修改] 动作掩码计算
+        对于 Mutation 策略，我们需要允许 "No-op" (即确认当前元素正确)，
+        因此大部分动作是有效的。
+        唯一需要掩码的情况是：当某个元素在 Slab 中彻底耗尽时，我们无法 Mutate *成为* 该元素。
+        但由于 reset 保证了化学计量比，且 step 保持守恒，这种情况理论上不会发生。
         """
         mask = np.ones(self.action_space.n, dtype=bool)
-        for action in range(self.action_space.n):
-            i, j = self._action_to_indices(action)
-            if self.state[i] == self.state[j]:
-                mask[action] = False
+        
+        # 统计当前各元素数量
+        counts = np.bincount(self.state, minlength=self.n_elements)
+        
+        # 如果某种元素数量为 0，则所有试图变 *成* 该元素的动作都无效
+        for el_idx in range(self.n_elements):
+            if counts[el_idx] == 0:
+                # 动作索引: site * n_elems + el_idx
+                # 使用切片将所有目标为 el_idx 的动作设为 False
+                mask[el_idx::self.n_elements] = False
+                
         return mask
         
     def step(self, action: int):
-        i, j = self._action_to_indices(action)
+        # [修改] 全新的 Mutation + Teleportation 逻辑
         
-        # [新增] 检查是否交换了相同的元素 (无效动作)
-        # 如果交换前后状态不变，直接给予小惩罚并跳过昂贵的能量计算
-        if self.state[i] == self.state[j]:
-            reward = -0.5 # 给予小惩罚，避免 Agent 偷懒
+        # 1. 解码动作：(Target Site, Target Element)
+        site_idx = action // self.n_elements
+        target_elem_idx = action % self.n_elements
+        
+        current_elem_idx = self.state[site_idx]
+        
+        # 2. 确认奖励 (Confirmation Bonus / No-op)
+        # 如果 Agent 认为 "Site i 应该是 A"，而它本来就是 A
+        # 这表明 GNN 对当前结构的理解是正确的，我们给予微小的正向反馈
+        if current_elem_idx == target_elem_idx:
+            reward = 0.1 # 小奖励，鼓励网络输出稳定的预测
             self.steps += 1
             truncated = self.steps >= self.config.max_steps
-            
-            # 状态未变，无需重新计算能量
             info = {
                 "energy": self.current_energy,
                 "uncertainty": self.current_uncertainty,
-                "swapped_sites": (i, j),
-                "energy_improvement": 0.0,
+                "action_type": "confirmation",
                 "atoms": self.atoms
             }
-            # 观察值也不变，直接返回当前的观察
+            # 状态未变，无需重新计算能量
             return self._state_to_observation(), reward, False, truncated, info
 
-        # 执行交换 (在 Active Region 内)
-        self.state[i], self.state[j] = self.state[j], self.state[i]
+        # 3. 寻找补偿原子 (Global Teleportation Candidates)
+        # Agent 想把 site_idx 变成 target_elem_idx
+        # 我们必须找一个当前是 target_elem_idx 的原子，把它变成 current_elem_idx
+        candidate_indices = np.where(self.state == target_elem_idx)[0]
+        
+        # 理论上 action_masks 已经过滤了这种情况，但为了鲁棒性再检查一次
+        if len(candidate_indices) == 0:
+            return self._state_to_observation(), -1.0, False, True, {}
+
+        # 4. 随机瞬移 (Random Teleportation)
+        # 这一步引入了极其关键的随机性，打破了局部最优的"死循环"
+        swap_partner_idx = self.rng.choice(candidate_indices)
+        
+        # 执行交换
+        self.state[site_idx] = target_elem_idx
+        self.state[swap_partner_idx] = current_elem_idx
+        
         self.steps += 1
 
         # 更新物理状态
@@ -216,17 +253,14 @@ class ChemGymEnv(gym.Env):
 
         # --- 奖励函数 ---
         energy_diff = self.prev_energy - self.current_energy
-        # 1. 大幅放大能量差信号 (从 200 增加到 1000)
-        # 这样 0.001 eV 的改进就能带来 +1.0 的奖励
         reward = energy_diff * 1000.0
         
-        # 2. 移除固定的 step_penalty，改为只对“无改进”的步数进行微小惩罚
+        # 允许微小的能量上升 (模拟退火思想)
         if energy_diff <= 0:
-            reward -= 0.01  # 极小的惩罚，迫使它寻找更好的构型
+            reward -= 0.01 
             
-        # 3. 引入“历史新低”额外奖励 (Record Breaking Bonus)
+        # 历史最优奖励
         if self.current_energy < self.min_energy_so_far:
-            # 只要打破了本局的最低能量记录，就额外给奖励
             bonus = (self.min_energy_so_far - self.current_energy) * 2000.0
             reward += bonus
             self.min_energy_so_far = self.current_energy
@@ -236,7 +270,7 @@ class ChemGymEnv(gym.Env):
         terminated = False
         truncated = self.steps >= self.config.max_steps
         
-        if self.current_energy > 5.0: # 物理异常检测
+        if self.current_energy > 5.0: 
             reward -= 10.0
             terminated = True
 
@@ -244,7 +278,8 @@ class ChemGymEnv(gym.Env):
         info = {
             "energy": self.current_energy,
             "uncertainty": self.current_uncertainty,
-            "swapped_sites": (i, j),
+            "swapped_sites": (site_idx, swap_partner_idx),
+            "action_type": "mutation",
             "energy_improvement": self.initial_energy - self.current_energy,
             "atoms": self.atoms
         }
@@ -253,11 +288,8 @@ class ChemGymEnv(gym.Env):
     def render(self):
         if self.render_mode is None:
             return None
-
         if plot_atoms is None or self.atoms is None:
             return None
-
-        # 渲染时旋转视角以便观察侧面（分层结构）
         fig = plot_atoms(self.atoms, show_unit_cell=0, rotation='-90x')
         if self.render_mode == "human":
             return fig
@@ -269,25 +301,16 @@ class ChemGymEnv(gym.Env):
         return None
 
     # --- 内部辅助函数 ---
-    def _action_to_indices(self, action: int) -> Tuple[int, int]:
-        # 解码动作：将单一整数 action 映射为 (i, j) 交换对
-        # 适用于任意大小的 n_active_atoms
-        if action < 0 or action >= self.action_space.n:
-            raise ValueError(f"Action {action} out of bounds")
-        remaining = action
-        # 遍历所有可能的第一个原子 i
-        for i in range(self.n_active_atoms - 1):
-            # i 之后的原子都可以作为 j
-            span = self.n_active_atoms - i - 1
-            if remaining < span:
-                return i, i + 1 + remaining
-            remaining -= span
-        raise ValueError(f"Action {action} could not be decoded")
+    
+    # 注意：旧的 _action_to_indices 已被 step 中的逻辑替代，
+    # 但为了兼容性或调试，这里可以保留一个 dummy 版本或者直接删除。
+    # 这里我们保留一个简化版以防外部调用。
+    def _action_to_indices(self, action: int):
+        # 仅用于 debug，不是真实的逻辑
+        return action // self.n_elements, action % self.n_elements
 
     def _state_to_observation(self):
         if self.config.mode == "image":
-            # Image mode 只取最表层 (Active Region 的最后一部分)
-            # 注意：state 是扁平的 Active Region，最表层在最后
             surface_state = self.state[-self.n_sites_per_layer:]
             flat_one_hot = np.eye(self.n_elements, dtype=np.float32)[surface_state]
             grid = flat_one_hot.reshape(self.config.slab_size[0], self.config.slab_size[1], self.n_elements)
@@ -304,7 +327,7 @@ class ChemGymEnv(gym.Env):
         positions = self.atoms.get_positions().astype(np.float32)
         n_total = len(symbols)
 
-        # 1. 节点特征构建
+        # 1. 节点特征
         pos_center = positions.mean(axis=0, keepdims=True)
         rel_pos = positions - pos_center
 
@@ -312,20 +335,13 @@ class ChemGymEnv(gym.Env):
         node_mask = np.ones((n_total,), dtype=np.float32)
 
         for i, sym in enumerate(symbols):
-            # One-Hot Encoding
             one_hot = np.zeros((self.n_elements,), dtype=np.float32)
             if sym in self.element_types:
                 one_hot[self.element_types.index(sym)] = 1.0
-            
-            # [科学改进] Layer Index
-            # ASE fcc111 从底向上构建，每层 n_sites_per_layer 个原子
-            # Layer 0 是最底层，Layer (n_layers-1) 是最表层
             layer_idx = i // self.n_sites_per_layer
-            
-            # Concat: [OneHot, RelPos, LayerIndex]
             node_features[i] = np.concatenate([one_hot, rel_pos[i], [float(layer_idx)]])
 
-        # 2. 邻接矩阵构建 (RBF)
+        # 2. 邻接矩阵 (RBF)
         dist = self.atoms.get_all_distances(mic=True).astype(np.float32)
         cutoff = float(self.config.graph_cutoff)
         sigma = float(self.config.graph_sigma)
@@ -343,19 +359,12 @@ class ChemGymEnv(gym.Env):
         }
 
     def _build_atoms_from_state(self):
-        """
-        根据 Active Region 的状态构建 ASE Atoms 对象。
-        """
-        if fcc111 is None:
-            return None
-        
+        if fcc111 is None: return None
         if self.atoms is None:
-            # Vegard's Law 计算平均晶格常数
             current_elements = [self.element_types[i] for i in self.state]
             avg_lattice_constant = float(np.mean([
                 self.LATTICE_CONSTANTS.get(el, 3.7) for el in current_elements
             ]))
-            
             self.atoms = fcc111(
                 "Cu", 
                 size=(self.config.slab_size[0], self.config.slab_size[1], self.config.n_layers), 
@@ -363,57 +372,54 @@ class ChemGymEnv(gym.Env):
                 vacuum=10.0
             )
             self.atoms.set_pbc(True)
-            # Tag 0: 固定的体相/底层原子
-            # Tag 1: 自由的表面原子 (Active Region)
-            # Tag 2: 吸附剂 (本场景无)
             tags = np.zeros(len(self.atoms), dtype=int)
-            
-            # 标记 Active Region 为 1
             n_total = len(self.atoms)
             start_idx = n_total - self.n_active_atoms
             tags[start_idx:] = 1
             self.atoms.set_tags(tags)
-
-            # [关键] 固定非 Active Region 的原子
             if FixAtoms is not None:
-                n_total = len(self.atoms)
-                # Active Region 在顶部，所以固定底部 (n_total - n_active_atoms) 个原子
                 n_fixed = n_total - self.n_active_atoms
                 if n_fixed > 0:
-                    constraint = FixAtoms(indices=range(n_fixed))
-                    self.atoms.set_constraint(constraint)
+                    self.atoms.set_constraint(FixAtoms(indices=range(n_fixed)))
         
-        # 更新 Active Region 的化学符号
-        # Active Region 对应 atoms 列表的最后 n_active_atoms 个元素
-        # self.atoms.set_positions(self.ideal_positions)
         n_total = len(self.atoms)
         start_idx = n_total - self.n_active_atoms
-        
         new_symbols = [self.element_types[idx] for idx in self.state]
-        
         for k, sym in enumerate(new_symbols):
             self.atoms[start_idx + k].symbol = sym
-            
         return self.atoms
 
     def _evaluate_energy(self, atoms: Optional["Atoms"]):
-        if atoms is None:
-            return 0.0, 0.0
-
+        if atoms is None: return 0.0, 0.0
+        
+        # [保持 UMA 逻辑]
         if self.oracle is not None:
             try:
-                # 统一调用 compute_energy 接口
-                # 对于 UMAOracle，它返回的是生成能 (eV/atom)；对于 EquiformerV2Oracle，它返回总能 (eV)
                 energy = self.oracle.compute_energy(atoms, relax=False)
-                
-                # 如果是旧模型 (EquiformerV2)，它返回的是总能，需要手动减去参考能并归一化
+                # 非 UMA 模型 (如 EquiformerV2) 需要手动扣除参考能
                 if not ("UMAOracle" in str(type(self.oracle))):
                     composition = atoms.get_chemical_symbols()
                     e_ref_total = sum([self.ref_energies.get(sym, 0.0) for sym in composition])
-                    # 修正逻辑：(总能 - 参考能) / 原子数
                     energy = (energy - e_ref_total) / len(atoms)
-                
                 return energy, 0.0
             except Exception as e:
                 print(f"Oracle calculation failed: {e}")
                 return 5.0, 0.0
+
+        if self.surrogate is not None:
+            return self.surrogate.evaluate(atoms)
+        
+        if EMT is not None:
+            try:
+                calc_atoms = atoms.copy()
+                calc_atoms.calc = EMT()
+                if calc_atoms.get_potential_energy() > 100.0: return 10.0, 0.0
+                if BFGS is not None:
+                    BFGS(calc_atoms, logfile=None).run(fmax=0.5, steps=20)
+                energy = calc_atoms.get_potential_energy() / len(calc_atoms)
+                if energy > 5.0 or energy < -10.0: return 5.0, 0.0
+                return energy, 0.0
+            except Exception as e:
+                print(f"Warning: EMT calculation failed: {e}")
+                return 5.0, 0.0
+        return 0.0, 0.0

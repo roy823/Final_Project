@@ -78,7 +78,9 @@ cd /root/shared-nvme/ChemGymProject
 ### 训练模型
 针对 3 层活性层（48 个原子）的复杂体系：
 ```bash
-/base/mambaforge/bin/python main.py     --mode train     --oracle-ckpt checkpoints/uma-s-1p1.pt     --obs-mode graph     --total-steps 60000     --n-active-layers 3     --learning-rate 1e-4     --device cuda 
+/base/mambaforge/bin/python main.py     --mode train     --oracle-ckpt checkpoints/uma-s-1p1.pt     --obs-mode graph     --total-steps 40000     --n-active-layers 3     --learning-rate 1e-4     --device cuda 
+
+/base/mambaforge/bin/python main.py     --mode train     --oracle-ckpt checkpoints/uma-s-1p1.pt     --obs-mode graph     --total-steps 40000     --n-active-layers 3     --learning-rate 1e-4     --device cuda   --use-masking
 ```
 ### 查看TensorBoard
 ```bash

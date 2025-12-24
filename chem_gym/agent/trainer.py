@@ -1,20 +1,19 @@
 from typing import Callable, Optional
-
 import gymnasium as gym
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, SubprocVecEnv
-from stable_baselines3.common.callbacks import BaseCallback  # 新增导入
-from stable_baselines3.common.callbacks import CallbackList
-# 导入 MaskablePPO 及其配套组件
 from sb3_contrib import MaskablePPO
-from sb3_contrib.common.maskable.utils import get_action_masks
-from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
+# [新增] 引入 ActionMasker
+from sb3_contrib.common.wrappers import ActionMasker
+
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 
 from chem_gym.config import EnvConfig, TrainConfig
 from chem_gym.envs.chem_env import ChemGymEnv
 from chem_gym.surrogate.ensemble import SurrogateEnsemble
 from chem_gym.analysis.vis_callback import VisualizationCallback
 from chem_gym.agent.graph_feature_extractor import CrystalGraphFeatureExtractor
+import datetime # [新增] 导入时间模块
 
 
 class UncertaintyPenaltyWrapper(gym.Wrapper):
@@ -24,18 +23,12 @@ class UncertaintyPenaltyWrapper(gym.Wrapper):
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-        # 只有当 info 中确实包含 uncertainty 且值非零时才扣分
         if self.coefficient and "uncertainty" in info:
             reward -= self.coefficient * float(info.get("uncertainty", 0.0))
         return obs, reward, terminated, truncated, info
 
 
 class OracleWrapper(gym.Wrapper):
-    """
-    Emulates an oracle call: if uncertainty > threshold, request oracle_energy_fn
-    and push it into the surrogate cache so future calls are lower-uncertainty.
-    """
-
     def __init__(self, env: ChemGymEnv, surrogate: SurrogateEnsemble, threshold: float,
                  oracle_energy_fn: Callable[[Optional[object]], float]):
         super().__init__(env)
@@ -45,31 +38,22 @@ class OracleWrapper(gym.Wrapper):
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-        
-        # 只有在 surrogate 存在时才有意义进行主动学习
         current_uncertainty = info.get("uncertainty", 0.0)
         
         if current_uncertainty > self.threshold:
             oracle_energy = self.oracle_energy_fn(info.get("atoms"))
-            # 更新 surrogate 缓存
             self.surrogate.update_with_oracle(info.get("atoms"), oracle_energy)
             info["oracle_energy"] = oracle_energy
             
         return obs, reward, terminated, truncated, info
 
 class EnergyLoggerCallback(BaseCallback):
-    """
-    自定义回调函数：每隔指定步数打印一次当前能量
-    """
     def __init__(self, verbose=0, log_freq=10):
         super().__init__(verbose)
         self.log_freq = log_freq
 
     def _on_step(self) -> bool:
-        # n_calls 是总步数。我们只在特定频率打印
         if self.n_calls % self.log_freq == 0:
-            # 从 VecEnv 的 info 中获取能量
-            # 因为是向量化环境，infos 是一个列表
             infos = self.locals.get("infos", [])
             if infos:
                 energy = infos[0].get("energy", "N/A")
@@ -77,46 +61,58 @@ class EnergyLoggerCallback(BaseCallback):
                 print(f"[Step {self.n_calls}] Energy: {energy:.4f} eV/atom | Reward: {reward:.4f}")
         return True
 
+class SelectiveVecNormalize(VecNormalize):
+    """自定义归一化器，跳过邻接矩阵和掩码"""
+    def _normalize_obs(self, obs, var_type):
+        if isinstance(obs, dict):
+            for key in obs.keys():
+                # 只归一化节点特征
+                if key == "node_features":
+                    obs[key] = super()._normalize_obs(obs[key], var_type)
+            return obs
+        return super()._normalize_obs(obs, var_type)
+
 def make_vec_env(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], train_config: TrainConfig,
-                 oracle_energy_fn: Optional[Callable] = None, oracle=None):
+                 oracle_energy_fn: Optional[Callable] = None, oracle=None, 
+                 use_masking: bool = False): # [修改] 接收 use_masking 参数
+    
     def _make_single():
-        # 这里 surrogate 可能是 None，ChemGymEnv 会自动处理回退到 EMT
         env = ChemGymEnv(env_config, surrogate=surrogate, oracle=oracle)
         
-        # 只有当 surrogate 存在时，才需要考虑不确定性惩罚和 Oracle 调用
         if surrogate is not None:
             if train_config.uncertainty_penalty > 0:
                 env = UncertaintyPenaltyWrapper(env, coefficient=train_config.uncertainty_penalty)
             
             if train_config.oracle_threshold is not None and oracle_energy_fn:
                 env = OracleWrapper(env, surrogate, train_config.oracle_threshold, oracle_energy_fn)
-                
+        
+        # [关键修改] 如果开启掩码，必须包裹 ActionMasker
+        # 这里的 lambda env: env.action_masks() 是告诉 Wrapper 怎么获取掩码
+        if use_masking:
+            env = ActionMasker(env, lambda env: env.action_masks())
+            
         return env
 
-    # 1. 创建基础向量化环境
     env = DummyVecEnv([_make_single for _ in range(train_config.n_envs)])
     
-    # 2. [关键修改] 使用 VecNormalize 归一化观测值和奖励
-    # norm_obs=True: 归一化观测值 (对 GNN 输入特征很有帮助)
-    # norm_reward=True: 归一化奖励 (解决 explained_variance 低的核心)
-    # clip_obs=10.0, clip_reward=10.0: 防止极端值破坏训练
-    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10., clip_reward=10.)
+    # VecNormalize 放在最后
+    env = SelectiveVecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10., clip_reward=10.)
     
     return env
 
 
 def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], train_config: TrainConfig,
-                oracle_energy_fn: Optional[Callable] = None, oracle=None, save_dir: str = "."):
-    vec_env = make_vec_env(env_config, surrogate, train_config, oracle_energy_fn, oracle=oracle)
-
+                oracle_energy_fn: Optional[Callable] = None, oracle=None, save_dir: str = ".",
+                use_masking: bool = False): 
     
-    # 策略网络选择
-    policy_kwargs = {}
+    # [修改] 将 use_masking 传递给 make_vec_env
+    vec_env = make_vec_env(env_config, surrogate, train_config, oracle_energy_fn, oracle=oracle, use_masking=use_masking)
 
+    policy_kwargs = {}
     if env_config.mode == "image":
-        policy = "MlpPolicy" # 对于 4x4 网格，MLP 足以处理且比 CNN 更快
+        policy = "MlpPolicy"
     elif env_config.mode == "graph":
-        policy = "MultiInputPolicy" # 用于 graph 模式
+        policy = "MultiInputPolicy"
         policy_kwargs = dict(
             features_extractor_class=CrystalGraphFeatureExtractor,
             features_extractor_kwargs=dict(features_dim=256, hidden_dim=128, n_layers=3),
@@ -124,10 +120,16 @@ def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], t
     else:
         raise ValueError(f"Unsupported mode: {env_config.mode}")
     
-    print(f"[Trainer] Initializing MaskablePPO with policy: {policy}")
+    if use_masking:
+        print(f"[Trainer] Initializing MaskablePPO (With Action Masking)")
+        model_class = MaskablePPO
+        tb_log_name = "MaskablePPO_Experiment"
+    else:
+        print(f"[Trainer] Initializing Standard PPO (No Masking)")
+        model_class = PPO
+        tb_log_name = "StandardPPO_Baseline"
     
-    # 将 PPO 替换为 MaskablePPO
-    model = MaskablePPO(
+    model = model_class(
         policy,
         vec_env,
         policy_kwargs=policy_kwargs,
@@ -136,38 +138,45 @@ def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], t
         gamma=train_config.gamma,
         gae_lambda=train_config.lam,
         device=train_config.device,
-        # 开启 Tensorboard 日志，用于观察物理能量曲线
-        n_steps=2048, # [建议] 增加采样步数，让梯度更稳
+        n_steps=2048,
         batch_size=128,
-        clip_range=0.2, # [建议] 限制更新幅度
-        ent_coef=0.001, # [建议] 增加探索
+        clip_range=0.2,
+        ent_coef=0.001,
         tensorboard_log="./chem_gym_tensorboard/"
     )
-    vis_callback = VisualizationCallback(save_freq=50, save_dir="./vis_results")
-    energy_callback = EnergyLoggerCallback(log_freq=5) # 每 5 步打印一次
     
-    # 使用 CallbackList 包装
+    vis_callback = VisualizationCallback(save_freq=500, save_dir="./vis_results")
+    energy_callback = EnergyLoggerCallback(log_freq=5)
     callbacks = CallbackList([vis_callback, energy_callback])
+
+    # [关键修改] 生成唯一的时间戳和运行 ID
+    timestamp = datetime.datetime.now().strftime("%m%d_%H%M") # 格式如: 1225_1430
+    run_type = "maskable" if use_masking else "standard"
+    steps_k = train_config.total_timesteps // 1000
+    run_id = f"{run_type}_{steps_k}k_{timestamp}"
+    
+    # 创建独立的运行文件夹
+    run_save_dir = os.path.join(save_dir, run_id)
+    os.makedirs(run_save_dir, exist_ok=True)
 
     print(f"Starting training for {train_config.total_timesteps} steps...")
     
-    # [关键修改：只调用一次 learn]
-    # 在训练时，MaskablePPO 会自动调用环境的 action_masks() 方法
     model.learn(
-        total_timesteps=train_config.total_timesteps,
+        total_timesteps=train_config.total_timesteps, 
         callback=callbacks,
+        tb_log_name=tb_log_name
     )
-    # ------------------------------
 
-    # 保存模型和归一化参数到指定目录
-    import os
-    os.makedirs(save_dir, exist_ok=True)
+    # 保存到独立文件夹
+    model_path = os.path.join(run_save_dir, "model")
+    stats_path = os.path.join(run_save_dir, "vec_normalize.pkl")
     
-    model_path = os.path.join(save_dir, "ppo_chem_gym")
-    stats_path = os.path.join(save_dir, "vec_normalize.pkl")
-    
-    print(f"[Trainer] Saving model to {model_path}...")
+    print(f"[Trainer] Saving weights to {run_save_dir}...")
     model.save(model_path)
     vec_env.save(stats_path)
+    
+    # [可选] 同时在根目录保存一个 "latest" 副本，方便 eval 脚本默认加载
+    model.save(os.path.join(save_dir, "latest_model"))
+    vec_env.save(os.path.join(save_dir, "latest_vec_normalize.pkl"))
     
     return model
