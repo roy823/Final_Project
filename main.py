@@ -39,6 +39,8 @@ def parse_args():
     parser.add_argument("--oracle-disable-amp", type=bool, default=True, help="禁用 AMP 提升稳定性")
     # [新增] 增加动作掩码开关
     parser.add_argument("--use-masking", action="store_true", help="使用动作掩码 (MaskablePPO)")
+    # [新增] 允许指定加载路径
+    parser.add_argument("--load-dir", type=str, default=None, help="Path to a specific run directory to load weights from")
     parser.add_argument("--save-dir", type=Path, default=Path("checkpoints"))
     return parser.parse_args()
 
@@ -154,34 +156,52 @@ def launch_eval(args):
     
     from chem_gym.envs.chem_env import ChemGymEnv
     from stable_baselines3.common.vec_env import DummyVecEnv
-    from sb3_contrib import MaskablePPO # 导入 MaskablePPO
+    from sb3_contrib import MaskablePPO
     
     def _make_single():
         return ChemGymEnv(env_config, oracle=eq2_model)
     
     base_venv = DummyVecEnv([_make_single])
     
-    # 3. 加载归一化统计数据 (优先加载 maskable 版本)
-    stats_path = args.save_dir / "vec_normalize_ppo_maskable.pkl"
-    if not stats_path.exists():
-        stats_path = Path("vec_normalize.pkl")
+    # 3. [优化] 智能路径搜索逻辑
+    if args.load_dir:
+        # 如果指定了文件夹，直接从那里加载
+        load_path = Path(args.load_dir)
+        stats_path = load_path / "vec_normalize.pkl"
+        model_path = load_path / "model"
+    else:
+        # 否则，按优先级搜索：latest -> ppo_maskable -> vec_normalize.pkl
+        stats_candidates = [
+            args.save_dir / "latest_vec_normalize.pkl",
+            args.save_dir / "vec_normalize_ppo_maskable.pkl",
+            Path("vec_normalize.pkl")
+        ]
+        stats_path = next((p for p in stats_candidates if p.exists()), None)
+        
+        model_candidates = [
+            args.save_dir / "latest_model",
+            args.save_dir / "ppo_maskable",
+            Path("ppo_chem_gym")
+        ]
+        model_path = next((p for p in model_candidates if p.with_suffix(".zip").exists()), None)
 
-    if stats_path.exists():
+    # 4. 加载归一化统计数据
+    if stats_path and stats_path.exists():
         print(f"[Eval] Loading normalization stats from {stats_path}...")
-        venv = VecNormalize.load(str(stats_path), base_venv)
-        venv.training = False
-        venv.norm_reward = False
+        try:
+            venv = VecNormalize.load(str(stats_path), base_venv)
+            venv.training = False
+            venv.norm_reward = False
+        except Exception as e:
+            print(f"[Error] Failed to load stats: {e}. Dimension mismatch likely.")
+            venv = base_venv
     else:
         print(f"[Warning] Normalization stats not found. Using unnormalized environment.")
         venv = base_venv
 
-    # 4. 加载模型 (优先加载 maskable 版本)
-    model_path = args.save_dir / "ppo_maskable"
-    if not model_path.with_suffix(".zip").exists():
-        model_path = Path("ppo_chem_gym")
-
-    if not model_path.with_suffix(".zip").exists():
-        print(f"Error: Model {model_path} not found!")
+    # 5. 加载模型
+    if not model_path or not model_path.with_suffix(".zip").exists():
+        print(f"Error: Model not found! Searched in: {model_path}")
         return
         
     print(f"[Eval] Loading model from {model_path}...")
@@ -195,7 +215,7 @@ def launch_eval(args):
         is_maskable = False
         print("Successfully loaded standard PPO model.")
 
-    # 5. 开始优化过程
+    # 6. 开始优化过程
     obs = venv.reset()
     print("\n" + "="*30)
     print("  STARTING STOCHASTIC OPTIMIZATION  ")
@@ -223,7 +243,8 @@ def launch_eval(args):
 
     print("="*30)
     print(f"Final Best Energy: {best_energy:.6f} eV/atom")
-
+    from chem_gym.analysis.advanced_vis import plot_structure_plotly
+    plot_structure_plotly(infos[0]['atoms'], f"Eval Best: {best_energy:.4f} eV", "eval")
 
 if __name__ == "__main__":
     cli_args = parse_args()

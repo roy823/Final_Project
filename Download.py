@@ -5,7 +5,6 @@ from tqdm import tqdm
 # 1. 切换到镜像站地址
 BASE_URL = "https://hf-mirror.com/facebook/UMA/resolve/main"
 
-
 # 官方要求的参考文件
 files = {
     f"{BASE_URL}/references/form_elem_refs.yaml": "checkpoints/references/form_elem_refs.yaml",

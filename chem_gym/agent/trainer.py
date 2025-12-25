@@ -1,3 +1,4 @@
+import os
 from typing import Callable, Optional
 import gymnasium as gym
 from stable_baselines3 import PPO
@@ -145,12 +146,8 @@ def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], t
         tensorboard_log="./chem_gym_tensorboard/"
     )
     
-    vis_callback = VisualizationCallback(save_freq=500, save_dir="./vis_results")
-    energy_callback = EnergyLoggerCallback(log_freq=5)
-    callbacks = CallbackList([vis_callback, energy_callback])
-
-    # [关键修改] 生成唯一的时间戳和运行 ID
-    timestamp = datetime.datetime.now().strftime("%m%d_%H%M") # 格式如: 1225_1430
+    # [修改] 生成唯一的时间戳和运行 ID
+    timestamp = datetime.datetime.now().strftime("%m%d_%H%M")
     run_type = "maskable" if use_masking else "standard"
     steps_k = train_config.total_timesteps // 1000
     run_id = f"{run_type}_{steps_k}k_{timestamp}"
@@ -159,7 +156,13 @@ def train_agent(env_config: EnvConfig, surrogate: Optional[SurrogateEnsemble], t
     run_save_dir = os.path.join(save_dir, run_id)
     os.makedirs(run_save_dir, exist_ok=True)
 
-    print(f"Starting training for {train_config.total_timesteps} steps...")
+    # [优化] 可视化结果也存入该运行文件夹下的 vis 子目录
+    run_vis_dir = os.path.join(run_save_dir, "vis")
+    vis_callback = VisualizationCallback(save_freq=200, save_dir=run_vis_dir) # 频率调快一点方便观察
+    energy_callback = EnergyLoggerCallback(log_freq=5)
+    callbacks = CallbackList([vis_callback, energy_callback])
+
+    print(f"Starting training: {run_id}")
     
     model.learn(
         total_timesteps=train_config.total_timesteps, 

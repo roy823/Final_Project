@@ -20,8 +20,12 @@ def make_env():
 
 base_venv = DummyVecEnv([make_env])
 
+# 修改为指向你最新的训练结果文件夹
+run_dir = "checkpoints/maskable_100k_1225_1031" 
+model_path = f"{run_dir}/model.zip"
+stats_path = f"{run_dir}/vec_normalize.pkl"
+
 # [关键] 加载 0.9 分模型对应的归一化参数
-stats_path = "checkpoints/vec_normalize_ppo_maskable.pkl"
 print(f"✅ Loading CORRECT normalization stats from {stats_path}...")
 venv = VecNormalize.load(stats_path, base_venv)
 venv.training = False
@@ -38,17 +42,16 @@ res_sa = simulated_annealing(venv.unwrapped.envs[0], STEPS)
 
 # 3. 运行 0.9 分的 MaskablePPO Agent
 print("\nRunning Trained Maskable DRL Agent...")
-model_path = "checkpoints/ppo_maskable"
 model = MaskablePPO.load(model_path, env=venv)
 print("✅ Successfully loaded MaskablePPO model!")
 
 res_drl = {"history": []}
 obs = venv.reset()
 best_e = float('inf')
+best_atoms = None # [新增] 用于记录最优结构
 
 for i in range(STEPS):
     masks = get_action_masks(venv)
-    # [修改] 将 True 改为 False，增加探索性
     action, _ = model.predict(obs, action_masks=masks, deterministic=False) 
     
     obs, rewards, dones, infos = venv.step(action)
@@ -56,10 +59,18 @@ for i in range(STEPS):
     
     if current_energy < best_e:
         best_e = current_energy
+        best_atoms = infos[0]['atoms'].copy() # [新增] 备份最优结构
+    
     res_drl["history"].append(best_e)
     
     if i % 50 == 0:
         print(f"DRL Step {i:03d} | Best Energy: {best_e:.6f} eV/atom")
+
+# [新增] 在脚本最后保存 HTML
+if best_atoms is not None:
+    from chem_gym.analysis.advanced_vis import plot_structure_plotly
+    print(f"\n✨ Saving best DRL structure to [drl_best_structure.html]...")
+    plot_structure_plotly(best_atoms, f"DRL Optimized: {best_e:.4f} eV/atom", "drl_best_structure.html")
 
 # 4. 绘图对比
 plt.figure(figsize=(10, 6))
